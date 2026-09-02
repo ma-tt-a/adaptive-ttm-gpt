@@ -126,7 +126,7 @@ class TTMatVec(t.autograd.Function):
         # =============
 
         # g_G_i: i <= d
-        U_2 = U_1.T @ X
+        U_2 = (U_1.T @ X).reshape(r_d + in_shape)
         g_G_left = []
 
         # i = 1
@@ -136,7 +136,7 @@ class TTMatVec(t.autograd.Function):
         expr_g_G = [i, 2 * d + 4]
 
         g_G_1 = t.einsum(
-            U_2.reshape(r_d + in_shape), expr_U_2,
+            U_2, expr_U_2,
             TTMatVec.A_inv_i(d-i, *cores), expr_A_inv_i,
             expr_g_G
         )[None, :, :]
@@ -150,7 +150,7 @@ class TTMatVec(t.autograd.Function):
             expr_g_G = [2 * d + 3, i, 2 * d + 4]
 
             g_G_i = t.einsum(
-                U_2.reshape(r_d + in_shape), expr_U_2,
+                U_2, expr_U_2,
                 TTMatVec.A_i(i-1, *cores), expr_A_i,
                 TTMatVec.A_inv_i(d-i, *cores), expr_A_inv_i,
                 expr_g_G
@@ -164,7 +164,7 @@ class TTMatVec(t.autograd.Function):
         expr_g_G = [2 * d + 3, i, 0]
 
         g_G_d = t.einsum(
-            U_2.reshape(r_d + in_shape), expr_U_2,
+            U_2, expr_U_2,
             TTMatVec.A_i(i-1, *cores), expr_A_i,
             expr_g_G
         )
@@ -173,7 +173,7 @@ class TTMatVec(t.autograd.Function):
         # =============
 
         # g_Gi: i >= d + 1
-        T_2 = g_Y[0].T @ T_1
+        T_2 = (g_Y[0].T @ T_1).reshape(out_shape + r_d)
         g_G_right = []
 
         # i = d + 1
@@ -183,7 +183,7 @@ class TTMatVec(t.autograd.Function):
         expr_g_G = [d, i, 2 * d + 3]
 
         g_G_d1 = t.einsum(
-            T_2.reshape(out_shape + r_d), expr_T_2,
+            T_2, expr_T_2,
             TTMatVec.B_inv_i(2*d-i, *cores), expr_B_inv_i,
             expr_g_G
         )
@@ -197,7 +197,7 @@ class TTMatVec(t.autograd.Function):
             expr_g_G = [2 * d + 2, i, 2 * d + 3]
 
             g_G_di = t.einsum(
-                T_2.reshape(out_shape + r_d), expr_T_2,
+                T_2, expr_T_2,
                 TTMatVec.B_i(i-1-d, *cores), expr_B_i,
                 TTMatVec.B_inv_i(2*d-i, *cores), expr_B_inv_i,
                 expr_g_G
@@ -211,7 +211,7 @@ class TTMatVec(t.autograd.Function):
         expr_g_G = [2 * d + 2, i]
 
         g_G_2d = t.einsum(
-            T_2.reshape(out_shape + r_d), expr_T_2,
+            T_2, expr_T_2,
             TTMatVec.B_i(i-1-d, *cores), expr_B_i,
             expr_g_G
         )[:, :, None]
