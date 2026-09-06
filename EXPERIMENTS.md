@@ -17,6 +17,7 @@ Locally the interpreter is `.venv/Scripts/python.exe`; in Colab it is plain `pyt
 | `--force` | off | recompute cells that are already cached instead of loading them. |
 | `--out DIR` | `results` | root for `runs/` (cache), `tables/` (csv), `plots/` (png). |
 | `--quiet` | off | silence inductor/dynamo compile chatter. |
+| `--track off\|tensorboard\|wandb` | `off` | live tracking of losses, perplexity and core diagnostics — see below. |
 | `--progress` | off | per-iteration tqdm bars. Off by default because colab `!python` is not a tty and tqdm then writes one line per update, burying the results. |
 | `--init scaled\|normal` | `scaled` | `scaled`: cores sized so the *contracted* matrix has std 0.02. `normal`: literal std=1.0, which diverges — there to demonstrate why the scaling exists. |
 
@@ -24,10 +25,29 @@ Locally the interpreter is `.venv/Scripts/python.exe`; in Colab it is plain `pyt
 
 | flag | default | what it does |
 |---|---|---|
-| `--batches 32 64 128` | `32 64 128` (smoke `8 16`) | batch sizes on the x axis of the epoch-time and peak-memory plots. |
+| `--batches 1 8 32 64 128` | `1 8 32 64 128` (smoke `8 16`) | batch sizes on the x axis of the epoch-time, step-time and peak-memory plots. The small batches are the interesting ones for compile: by batch 128 the matmuls amortise the launch overhead on their own and every mode converges. |
 | `--compile-modes eager compile cudagraph` | all three | which of the three modes to measure. `compile` is inductor fusion, `cudagraph` is fusion + CUDA Graphs (a no-op on xpu). |
 | `--bench-rank N` | `32` | `max_rank` of the tensorized model being benchmarked. |
 | `--bench-reps N` | `30` (smoke `5`) | timed forward/backward repetitions per cell, after 5 warmup steps (2 in smoke). |
+
+The memory pass of a bench cell runs a **full training step with AdamW**, kept separate from the
+timing pass (which stays forward/backward only — that is the CoMERA figure). Two states per parameter
+is exactly the part of the tensorized saving that forward/backward alone cannot show, while the extra
+intermediate `TTMatVec` saves (`X` *and* `T_1`) is charged either way. Measured at `n_embd=256`,
+6 layers, eager, peak of a full step:
+
+| batch | dense | tensorized | ratio |
+|---|---|---|---|
+| 1 | 96 MB | 26 MB | 0.27x |
+| 8 | 191 MB | 144 MB | 0.76x |
+| 128 | 2162 MB | 2163 MB | 1.00x |
+
+Parameters plus AdamW states are 57.5 MB dense against 6.8 MB tensorized *at every batch size* — what
+changes is the activation memory piled on top, which scales with tokens per step and is identical in
+both models. The tensorized memory win is a parameter-side win, so it is visible exactly when the
+model width is comparable to the tokens per step (roughly `3*C/BT` of the activation cost with Adam),
+and invisible at large batch. `BENCH_PROTOCOL` guards this: bumping it recomputes bench cells whose
+memory numbers were measured under an older protocol instead of mixing them with new ones.
 
 ### Phase 2 — training
 
@@ -51,11 +71,85 @@ Sampled during training, so these flags only affect arms that are actually (re)c
 | `--core-diag-role c_attn\|attn_proj\|c_fc\|mlp_proj` | `c_fc` | which role the per-arm figure draws. Every probed role is written to `core_stats.csv` regardless; only the plot is narrowed, because a panel with 4 roles x 2d cores is unreadable. |
 
 What is probed: every TT role in the **first, middle and last** block (`{0, n_layer//2, n_layer-1}`),
-every core of those layers. Recorded per core: `mean`, `std`, `absmax`, `norm`, the gradient norm of
-that step, and — in adaptive arms — the mean/min of the rank parameter gating its trailing bond plus
-how many of its entries are still above the threshold (`rank_alive`). The whole snapshot is one
-`stack` + one `.tolist()`, i.e. a single device synchronize, so it does not leak into the step-time
-medians.
+every core of those layers. Two tables come out of each snapshot:
+
+- **per core** (`core_stats.csv`) — `mean`, `std`, `absmax`, `norm`, the gradient norm of that step,
+  and, in adaptive arms, the mean/min of the rank parameter gating its trailing bond plus how many of
+  its entries are still above the threshold (`rank_alive`).
+- **per core group** (`core_dist.csv`) — percentiles (p1/p25/p50/p75/p99) of the concatenated entries
+  of the cores left of the middle bond, the two centre cores, and the cores right of it. Percentiles
+  of the concatenation, not an average of per-core percentiles, which would not be a percentile of
+  anything. Cores are read unmasked; the mask is reported separately as `rank_mean`.
+
+The whole snapshot is one `cat` + one `.tolist()`, i.e. a single device synchronize, so it does not
+leak into the step-time medians.
+
+## Tracking a run live
+
+Off unless `--track` is given. `--track tensorboard` is the default choice; `--track wandb` uses the
+same interface against Weights & Biases.
+
+```bash
+python run_experiments.py --track tensorboard
+```
+
+then, in another shell (or a Colab cell, see below):
+
+```bash
+tensorboard --logdir results/tb
+```
+
+Three kinds of run per invocation, each its own subdirectory under `results/tb/<group>/`, so
+TensorBoard overlays them and the run selector on the left doubles as the arm filter:
+
+| run | how many | what it carries |
+|---|---|---|
+| `train-<arm>` | one per training arm | live curves: `train/loss`, `val/loss`, **`train/ppl`, `val/ppl`**, `params/effective`, `rank_loss`, `step_ms`, `lr_mult` every `eval_interval`, plus the core diagnostics (`core/grad_norm`, `core/rank_mean`, `core/<group>/p*`) every `core_diag_interval`. Ends with `final/*` scalars, the generated text sample under TEXT, and an HPARAMS row pairing the arm's config with its final metrics |
+| `bench-bench` | one per invocation | the phase-1 sweep as a markdown table under TEXT, plus `epoch_total_min/<cell>`, `step_ms/<cell>`, `peak_step_mb/<cell>` scalars |
+| `report-report` | one per invocation | every plot under IMAGES and the csv list under TEXT, once the phases are done |
+
+Perplexity is logged next to the loss because it is the number the arms are judged on; both are
+clamped at `exp(min(loss, 20))`, so a diverged arm cannot stretch the chart's y-range to infinity.
+Everything is written against `iter`, so arms logged at different cadences line up on one x axis, and
+the writer flushes every 30 s -- the point is watching a run while it happens.
+
+**Colab.** TensorBoard runs inside the notebook, no account and no network setup:
+
+```bash
+%load_ext tensorboard
+```
+
+```bash
+%tensorboard --logdir results/tb
+```
+
+Start it *before* the training cell and it refreshes on its own while `!python run_experiments.py
+--track tensorboard` runs.
+
+**A remote box (A100).** Point TensorBoard at the same directory on the server and forward the port:
+
+```bash
+ssh -N -L 6006:localhost:6006 user@host
+```
+
+```bash
+tensorboard --logdir results/tb --port 6006 --bind_all
+```
+
+| flag | default | what it does |
+|---|---|---|
+| `--track off\|tensorboard\|wandb` | `off` | which backend to log to |
+| `--wandb-group NAME` | timestamp | names the `results/tb/<group>` directory, or the wandb group |
+| `--wandb-project NAME` | `adaptive-ttm-gpt` | wandb only |
+| `--wandb-entity NAME` | your default entity | wandb only |
+| `--wandb-mode online\|offline\|disabled` | `online` | wandb only; `offline` writes to `<out>/wandb` for a later `wandb sync`, and is also the automatic fallback when no API key is available, since an interactive login would hang a colab `!python` job |
+
+**Nothing here can kill a run.** `tracking.Run` is a working object whether or not the backend is
+installed or reachable; every call swallows its exception after reporting the first one. A missing
+package prints one line and the harness continues.
+
+**Cached cells do not log.** Runs are created where the compute happens, so an arm loaded from
+`results/runs/*.json` produces no tracking run. Re-run it with `--force` to put it on the dashboard.
 
 ## Outputs
 
@@ -65,18 +159,21 @@ be mistaken for a full one.
 
 | file | contents |
 |---|---|
-| `tables/bench.csv` | per configuration and batch: fwd/bwd step time, projected minutes per epoch, peak memory, compile diagnostics |
+| `tables/bench.csv` | per configuration and batch: fwd/bwd step time, projected minutes per epoch, peak memory (fwd / fwd+bwd / fwd+bwd+AdamW step), optimizer-state size, compile diagnostics |
 | `tables/train.csv` | per arm: effective params, compression, val loss/ppl, step time, memory |
 | `tables/ranks.csv` | one row per arm x TT layer x bond: initial and final rank |
 | `tables/rank_summary.csv` | per adaptive arm: `pruned_frac`, mean/min/max rank, dead bonds |
 | `tables/core_stats.csv` | one row per arm x snapshot x TT layer x core: mean/std/absmax/norm, gradient norm, rank-parameter state |
+| `tables/core_dist.csv` | one row per arm x snapshot x TT layer x core group: percentiles of the core entries |
 | `tables/memory.csv` | static footprint next to the measured peaks |
 | `plots/1_epoch_{forward,backward}.png`, `2_epoch_total.png` | the CoMERA bar chart |
+| `plots/2b_step_time.png` | ms per step (fwd + bwd) — the view the small batches exist for, since an epoch at batch 1 is 128x more steps than at batch 128 |
 | `plots/3_pareto_params.png` | val loss vs surviving parameters, one curve per family |
 | `plots/4_loss_curves.png`, `4b_pruning_over_training.png` | training dynamics |
-| `plots/5_rank_pruned_frac.png`, `5b_rank_hist.png`, `5c_rank_heatmap.png`, `5d_rank_by_role.png` | final rank configuration |
-| `plots/6_cores_<arm>.png` | one figure per arm: core std, `|max|`, gradient norm and rank-parameter mean through training, one row per probed block, one line per core (log axes wherever the quantity stays positive) |
-| `plots/7_mem_static.png`, `8_mem_peak_{forward,backward}.png` | memory footprint |
+| `plots/5_rank_pruned_frac.png`, `5c_rank_heatmap.png`, `5d_rank_by_role.png` | final rank configuration |
+| `plots/5e_rank_kept_frac.png` | same layer x bond grid as `5c`, but `kept_frac` instead of the absolute rank. Read this one to judge pruning: the chain ends never start at `max_rank` (`get_uniform_rank` clips them by the mode products), so on the absolute map every arm looks pruned at the edges when nothing was pruned there. |
+| `plots/6_cores_<arm>.png` | one figure per arm, one row per probed block: three percentile-band panels for the core values (left half of the chain, the two centre cores, right half), then the per-core gradient norm and rank-parameter mean (log axes wherever the quantity stays positive) |
+| `plots/7_mem_static.png`, `8_mem_peak_{forward,backward}.png`, `8b_mem_peak_step.png` | memory footprint. `8b` is the one to read: it includes the AdamW states, i.e. the half of the tensorized saving a fwd+bwd measurement never sees |
 
 ## Reading the warnings
 

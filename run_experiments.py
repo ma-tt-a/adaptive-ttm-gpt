@@ -34,6 +34,7 @@ measured once, across batch sizes; quality is measured once, compiled only.
 """
 import argparse
 import csv
+import glob
 import hashlib
 import json
 import math
@@ -48,6 +49,7 @@ import torch._dynamo
 from tqdm.auto import tqdm
 
 import comera
+import tracking
 from data import CharDataset
 from gpt import GPT, GPTConfig, TT_SHAPES
 from tensorized_layers import TTLinear
@@ -61,7 +63,8 @@ BAR_DISABLE = True
 
 # None = eager; the strings are torch.compile modes. MODE_TAG is what goes into
 # filenames and code, MODE_LABEL is what a reader of a plot sees.
-MODE_TAG = {None: "eager", "default": "compile", "reduce-overhead": "cudagraph"}
+MODE_TAG = {None: "eager", "default": "compile",
+            "reduce-overhead": "cudagraph"}
 MODE_LABEL = {None: "eager",
               "default": "compiled w/o CUDAGraph",
               "reduce-overhead": "compiled w/ CUDAGraph"}
@@ -84,10 +87,17 @@ def label_of(kind: str, mode: Optional[str]) -> str:
 # phase 1
 BENCH_KINDS = ["dense", "tensorized"]
 BENCH_MODES = [None, "default", "reduce-overhead"]
-BENCH_BATCHES = [32, 64, 128]
+# batch 1 and 8 are where compile is actually interesting: at batch 128 the
+# matmuls are large enough to amortise the launch overhead on their own, so
+# every mode converges and the plot says nothing
+BENCH_BATCHES = [1, 8, 32, 64, 128]
 BENCH_MAX_RANK = 32
 BENCH_WARMUP = 5     # steps paid before timing, so the JIT and the CUDA-Graph
 BENCH_REPS = 30      # capture are out of the way
+# bumped whenever a bench cell measures something different under the same
+# flags, so stale cells recompute instead of being silently mixed in with new
+# ones. 2: the memory pass runs a full AdamW step, states included
+BENCH_PROTOCOL = 2
 
 # phase 2
 UNIFORM_RANKS = [4, 8, 16, 32]
@@ -451,15 +461,36 @@ def bench_cell(kind: str, mode: Optional[str], batch: int, cfg: TrainConfig,
         raw_model.zero_grad(set_to_none=True)
 
     # memory pass, kept apart from the timing pass because
-    # reset_peak_memory_stats/empty_cache perturb the numbers above
-    peak_fwd = peak_bwd = 0
+    # reset_peak_memory_stats/empty_cache perturb the numbers above.
+    #
+    # The optimizer is part of it on purpose. AdamW keeps two states per
+    # parameter, so fwd+bwd alone charges the tensorized model for the extra
+    # intermediate TTMatVec saves (X *and* T_1) while crediting it for only
+    # half of what it saves on the parameter side -- the comparison it loses
+    # is not the one training actually pays. Same three-way split as phase 2,
+    # so the two phases measure the same optimizer.
+    opt = comera.make_optimizer(raw_model)
+    # Adam allocates exp_avg/exp_avg_sq lazily on the first step; that
+    # allocation belongs to the steady state, not to the measured peak
+    _, loss = model(X, Y)
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+    opt.step()
+
+    peak_fwd = peak_bwd = peak_step = 0
     for _ in range(2):
+        opt.zero_grad(set_to_none=True)
         reset_memory(device)
         _, loss = model(X, Y)
         peak_fwd = max(peak_fwd, peak_memory(device))
         loss.backward()
         peak_bwd = max(peak_bwd, peak_memory(device))  # peak over fwd+bwd
-        raw_model.zero_grad(set_to_none=True)
+        opt.step()
+        peak_step = max(peak_step, peak_memory(device))  # + the update
+    opt_state_bytes = sum(v.numel() * v.element_size()
+                          for st in opt.state.values() for v in st.values()
+                          if t.is_tensor(v))
+    opt.zero_grad(set_to_none=True)
 
     steps_per_epoch = max(1, len(ds.splits["train"]) //
                           (batch * cfg.block_size))
@@ -472,7 +503,8 @@ def bench_cell(kind: str, mode: Optional[str], batch: int, cfg: TrainConfig,
         "block_size": cfg.block_size,
         "max_rank": max_rank if kind == "tensorized" else None,
         "config_hash": hash_payload(kind, MODE_TAG[mode], batch, max_rank,
-                                    asdict(cfg), reps, warmup),
+                                    asdict(cfg), reps, warmup,
+                                    BENCH_PROTOCOL),
         "fwd_s": fwd_s,
         "bwd_s": bwd_s,
         "step_s": fwd_s + bwd_s,
@@ -482,10 +514,16 @@ def bench_cell(kind: str, mode: Optional[str], batch: int, cfg: TrainConfig,
         "epoch_total_min": (fwd_s + bwd_s) * steps_per_epoch / 60,
         "peak_fwd_bytes": peak_fwd,
         "peak_bwd_bytes": peak_bwd,
+        "peak_step_bytes": peak_step,
         "peak_fwd_mb": peak_fwd / 1e6,
         "peak_bwd_mb": peak_bwd / 1e6,
+        "peak_step_mb": peak_step / 1e6,
         "param_bytes": param_bytes,
         "param_mb": param_bytes / 1e6,
+        # what AdamW itself holds: two states per parameter, i.e. the half of
+        # the tensorized saving that a fwd+bwd-only measurement never sees
+        "opt_state_bytes": opt_state_bytes,
+        "opt_state_mb": opt_state_bytes / 1e6,
         "nominal_params": nominal_params,
         "first_step_s": first_step_s,
         "compile_time_s": compile_time,
@@ -506,11 +544,19 @@ def run_bench(cfg: TrainConfig, ds: CharDataset, device: t.device,
               reps: int, warmup: int, force: bool,
               allowed: bool) -> List[dict]:
     records = []
+    # one run for the whole sweep: a bench cell is a handful of numbers, not a
+    # time series, so the useful artefact is the table plus flat summaries
+    run = tracking.Run("bench", "bench", tags=["bench"],
+                       config={**asdict(cfg), "phase": "bench",
+                               "device": str(device), "batches": batches,
+                               "bench_rank": max_rank, "reps": reps,
+                               "warmup": warmup,
+                               "modes": [MODE_TAG[m] for m in modes]})
     cells = [(k, m, b) for k in BENCH_KINDS for m in modes for b in batches]
     for kind, mode, batch in tqdm(cells, desc="bench", disable=BAR_DISABLE):
         tag = f"{kind}_{MODE_TAG[mode]}_b{batch}"
         want = hash_payload(kind, MODE_TAG[mode], batch, max_rank,
-                            asdict(cfg), reps, warmup)
+                            asdict(cfg), reps, warmup, BENCH_PROTOCOL)
         path = os.path.join(RUNS_DIR, f"bench_{tag}_{want}.json")
         rec = cached_or_compute(
             path, want,
@@ -520,11 +566,17 @@ def run_bench(cfg: TrainConfig, ds: CharDataset, device: t.device,
         if rec is None:
             continue
         records.append(rec)
+        cell = f"{rec['kind']}/{rec['compile_mode']}/b{batch}"
+        run.summary({f"epoch_total_min/{cell}": rec["epoch_total_min"],
+                     f"step_ms/{cell}": rec["step_s"] * 1e3,
+                     f"peak_step_mb/{cell}": rec.get("peak_step_mb")})
         if "wall_clock_s" in rec:
             tqdm.write(f"  {tag}: fwd {rec['fwd_s']*1e3:.2f} ms  "
                        f"bwd {rec['bwd_s']*1e3:.2f} ms  -> epoch "
                        f"{rec['epoch_total_min']:.1f} min  "
                        f"peak {rec['peak_bwd_mb']:.0f} MB")
+    run.table("bench", BENCH_COLUMNS, records)
+    run.finish()
     return records
 
 
@@ -540,10 +592,33 @@ def run_bench(cfg: TrainConfig, ds: CharDataset, device: t.device,
 # recorded lands in core_stats.csv; the plot shows one role because a panel
 # with 4 roles x 2d cores is unreadable.
 CORE_DIAG_PLOT_ROLE = "c_fc"
-CORE_DIAG_FIELDS = [("std", "core std", True),
-                    ("absmax", "core |max|", True),
-                    ("grad_norm", "grad norm", True),
+# line panels, one line per core. std and absmax used to live here too; a
+# summary statistic of a roughly symmetric distribution says little that the
+# percentile bands below do not say better
+CORE_DIAG_FIELDS = [("grad_norm", "grad norm", True),
                     ("rank_mean", "rank param mean", False)]
+
+# band panels: the value distribution of a group of cores, as percentiles of
+# the concatenated entries. Split around the middle bond, because the two
+# halves of a TT chain carry different modes -- input on the left, output on
+# the right -- and there is no reason for them to drift together
+CORE_DIAG_QUANTILES = (0.01, 0.25, 0.5, 0.75, 0.99)
+PCT_LABEL = "p%d"
+CORE_DIST_GROUPS = [("left", "cores left of centre"),
+                    ("centre", "the two centre cores"),
+                    ("right", "cores right of centre")]
+
+
+def core_groups(cores: List[t.Tensor]):
+    """
+    (name, cores) per half of the chain, plus the pair around the middle bond
+    -- the widest bond, and the one the adaptive scheme has the most to remove
+    from.
+    """
+    d = len(cores) // 2
+    return [("left", cores[:d]),
+            ("centre", cores[d - 1:d + 1]),
+            ("right", cores[d:])]
 
 
 def diag_layers(model: GPT, cfg: TrainConfig) -> List[Tuple[str, TTLinear]]:
@@ -560,21 +635,29 @@ def diag_layers(model: GPT, cfg: TrainConfig) -> List[Tuple[str, TTLinear]]:
 
 
 @t.no_grad()
-def core_snapshot(layers: List[Tuple[str, TTLinear]], it: int) -> List[dict]:
+def core_snapshot(layers: List[Tuple[str, TTLinear]],
+                  it: int) -> Tuple[List[dict], List[dict]]:
     """
-    One row per core: its distribution, its gradient, and the rank parameter
-    gating its trailing bond.
+    Two views of the same moment: one row per core (summary statistics, the
+    gradient, and the rank parameter gating its trailing bond) and one row per
+    core group (percentiles of the concatenated entries).
 
-    Every statistic is computed on device and read back through a single
-    stack + .tolist(), so a snapshot costs one synchronize rather than one per
+    The percentiles are taken over the concatenation rather than averaged
+    across per-core percentiles, which would not be a percentile of anything.
+
+    Everything is computed on device and read back through a single flat cat
+    + .tolist(), so a snapshot costs one synchronize rather than one per
     number -- otherwise sampling every 100 iterations would show up in the
-    step-time medians.
+    step-time medians. The cores are read unmasked; the mask is a separate
+    quantity, reported as rank_mean.
     """
     stats, meta = [], []
+    dist, dist_meta = [], []
     for name, m in layers:
         rank_params = list(m.rank_params) if m.rank_params is not None else []
         thr = m.cfg.threshold
-        for n, G in enumerate(m.cores):
+        cores = list(m.cores)
+        for n, G in enumerate(cores):
             nan = t.full((), float("nan"), device=G.device)
             zero = t.zeros((), device=G.device)
             g = G.grad
@@ -587,25 +670,76 @@ def core_snapshot(layers: List[Tuple[str, TTLinear]], it: int) -> List[dict]:
                 (r > thr).sum().float() if r is not None else zero,
             ]))
             meta.append((name, n))
+
+        q = t.tensor(CORE_DIAG_QUANTILES, device=cores[0].device)
+        for gname, group in core_groups(cores):
+            x = t.cat([G.reshape(-1) for G in group]).float()
+            dist.append(t.quantile(x, q))
+            dist_meta.append((name, gname))
     if not stats:
-        return []
+        return [], []
+
+    # one read-back for both tables
+    nstat, nq = len(stats), len(CORE_DIAG_QUANTILES)
+    flat = t.cat([t.stack(stats).reshape(-1),
+                  t.stack(dist).reshape(-1)]).cpu().tolist()
+    core_vals, dist_vals = flat[:nstat * 8], flat[nstat * 8:]
 
     rows = []
-    for (name, n), v in zip(meta, t.stack(stats).cpu().tolist()):
+    for i, (name, n) in enumerate(meta):
+        v = core_vals[i * 8:(i + 1) * 8]
         block, role = parse_layer_name(name)
         rows.append({"iter": it, "layer": name, "block": block, "role": role,
                      "core": n, "mean": v[0], "std": v[1], "absmax": v[2],
                      "norm": v[3], "grad_norm": v[4], "rank_mean": v[5],
                      "rank_min": v[6], "rank_alive": v[7]})
-    return rows
+
+    drows = []
+    labels = [PCT_LABEL % int(q * 100) for q in CORE_DIAG_QUANTILES]
+    for i, (name, gname) in enumerate(dist_meta):
+        v = dist_vals[i * nq:(i + 1) * nq]
+        block, role = parse_layer_name(name)
+        row = {"iter": it, "layer": name, "block": block, "role": role,
+               "group": gname}
+        row.update(zip(labels, v))
+        drows.append(row)
+    return rows, drows
 
 
-def core_rows(rec: dict) -> List[dict]:
+def core_track_metrics(core_snap: List[dict],
+                       dist_snap: List[dict]) -> Dict[str, float]:
+    """
+    A snapshot reduced to ~16 series for the live dashboard.
+
+    Averaged over the probed layers on purpose: logging every core of every
+    probed layer separately is 500 series, which is a table, not a chart. The
+    per-core detail is in core_stats.csv / core_dist.csv.
+    """
+    out: Dict[str, float] = {}
+    grads = [r["grad_norm"] for r in core_snap
+             if math.isfinite(r.get("grad_norm", float("nan")))]
+    if grads:
+        out["core/grad_norm"] = sum(grads) / len(grads)
+    ranks = [r["rank_mean"] for r in core_snap
+             if math.isfinite(r.get("rank_mean", float("nan")))]
+    if ranks:
+        out["core/rank_mean"] = sum(ranks) / len(ranks)
+    for group, _ in CORE_DIST_GROUPS:
+        mine = [r for r in dist_snap if r["group"] == group]
+        if not mine:
+            continue
+        for q in CORE_DIAG_QUANTILES:
+            key = PCT_LABEL % int(q * 100)
+            out[f"core/{group}/{key}"] = sum(r[key] for r in mine) / len(mine)
+    return out
+
+
+def core_rows(rec: dict, key: str = "core_diag") -> List[dict]:
     """
     A trained arm's snapshots, tagged with the arm they came from
     """
     return [dict(r, arm=rec["arm"], family=rec["family"])
-            for r in rec.get("core_diag", [])]
+            for r in rec.get(key, [])]
 
 
 def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
@@ -628,10 +762,19 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
     gen = t.Generator().manual_seed(cfg.seed)  # identical batch stream per arm
     reset_memory(device)
 
+    run = tracking.Run("train", arm.name, tags=[arm.kind, MODE_TAG[mode]],
+                       config={**asdict(arm), **asdict(cfg),
+                               "phase": "train",
+                               "compile_mode": MODE_TAG[mode],
+                               "device": str(device),
+                               "nominal_params": nominal_params,
+                               "param_mb": param_bytes / 1e6})
+
     history = {"iter": [], "train": [], "val": [], "eff_params": [],
                "eff_size": [], "rank_loss": []}
     probed = diag_layers(raw_model, cfg) if cfg.core_diag_interval else []
     core_diag: List[dict] = []
+    core_dist: List[dict] = []
     step_times: List[float] = []
     first_step_time = None
 
@@ -660,7 +803,10 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
         # after opt.step(), so the gradients of this step are still live
         if probed and (it % cfg.core_diag_interval == 0
                        or it == cfg.max_iters - 1):
-            core_diag.extend(core_snapshot(probed, it))
+            snap, dsnap = core_snapshot(probed, it)
+            core_diag.extend(snap)
+            core_dist.extend(dsnap)
+            run.log(core_track_metrics(snap, dsnap), it)
 
         if it == 0:
             first_step_time = timer.times[0]
@@ -677,6 +823,19 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
             history["eff_params"].append(comera.effective_params(raw_model))
             history["eff_size"].append(comera.model_size(raw_model))
             history["rank_loss"].append(rl)
+            # perplexity alongside the loss: it is the number the run is
+            # actually judged on, and exp() of a diverged loss overflows the
+            # chart, so it is clamped the same way the final metric is
+            run.log({"train/loss": losses["train"],
+                     "val/loss": losses["val"],
+                     "train/ppl": math.exp(min(losses["train"], 20)),
+                     "val/ppl": math.exp(min(losses["val"], 20)),
+                     "params/effective": history["eff_params"][-1],
+                     "params/tt_size": history["eff_size"][-1],
+                     "rank_loss": rl,
+                     "lr_mult": mult,
+                     "step_ms": (median(step_times) * 1e3
+                                 if step_times else float("nan"))}, it)
             bar.set_postfix(val=f"{losses['val']:.3f}",
                             eff=f"{history['eff_params'][-1]/1e3:.0f}k")
             first = (it == 0 and cfg.max_iters > 1)
@@ -703,6 +862,17 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
 
     final_val = history["val"][-1]
     eff_params = history["eff_params"][-1]
+    run.summary({"final/val_loss": final_val,
+                 "final/val_ppl": math.exp(min(final_val, 20)),
+                 "final/train_loss": history["train"][-1],
+                 "final/best_val_loss": min(history["val"]),
+                 "final/effective_params": eff_params,
+                 "final/step_ms": median(step_times) * 1e3,
+                 "final/peak_memory_mb": mem / 1e6,
+                 "final/compile_time_s": compile_time,
+                 "final/diverged": not math.isfinite(final_val),
+                 "sample": sample})
+    run.finish()
     return {
         "arm": arm.name,
         "kind": arm.kind,
@@ -739,6 +909,7 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
         "diverged": not math.isfinite(final_val),
         "history": history,
         "core_diag": core_diag,
+        "core_dist": core_dist,
         "init_ranks": init_ranks,
         "final_ranks": ranks,
         "sample": sample,
@@ -892,12 +1063,14 @@ def markdown_table(rows: List[dict], columns: List[str],
 
 BENCH_COLUMNS = ["label", "kind", "compile_mode", "batch", "fwd_s", "bwd_s",
                  "epoch_fwd_min", "epoch_bwd_min", "epoch_total_min",
-                 "peak_fwd_mb", "peak_bwd_mb", "param_mb", "memory_comparable",
+                 "peak_fwd_mb", "peak_bwd_mb", "peak_step_mb", "param_mb",
+                 "opt_state_mb", "memory_comparable",
                  "first_step_s", "compiled_frames", "graph_breaks",
                  "cudagraph_skips"]
 BENCH_FMT = {"fwd_s": ".5f", "bwd_s": ".5f", "epoch_fwd_min": ".2f",
              "epoch_bwd_min": ".2f", "epoch_total_min": ".2f",
-             "peak_fwd_mb": ".1f", "peak_bwd_mb": ".1f", "param_mb": ".2f",
+             "peak_fwd_mb": ".1f", "peak_bwd_mb": ".1f",
+             "peak_step_mb": ".1f", "param_mb": ".2f", "opt_state_mb": ".2f",
              "first_step_s": ".2f"}
 
 TRAIN_COLUMNS = ["arm", "family", "compile_mode", "max_rank", "lr_rank",
@@ -929,10 +1102,16 @@ CORE_FMT = {"mean": ".3e", "std": ".3e", "absmax": ".3e", "norm": ".3e",
             "grad_norm": ".3e", "rank_mean": ".4f", "rank_min": ".4f",
             "rank_alive": ".0f"}
 
+CORE_DIST_COLUMNS = (["arm", "family", "iter", "layer", "block", "role",
+                      "group"]
+                     + [PCT_LABEL % int(q * 100) for q in CORE_DIAG_QUANTILES])
+
 MEMORY_COLUMNS = ["scope", "name", "batch", "param_mb", "effective_param_mb",
-                  "peak_fwd_mb", "peak_bwd_mb", "memory_comparable"]
+                  "opt_state_mb", "peak_fwd_mb", "peak_bwd_mb", "peak_step_mb",
+                  "memory_comparable"]
 MEMORY_FMT = {"param_mb": ".2f", "effective_param_mb": ".2f",
-              "peak_fwd_mb": ".1f", "peak_bwd_mb": ".1f"}
+              "opt_state_mb": ".2f", "peak_fwd_mb": ".1f",
+              "peak_bwd_mb": ".1f", "peak_step_mb": ".1f"}
 
 
 def decorate_train(records: List[dict]) -> List[dict]:
@@ -992,6 +1171,19 @@ def grouped_bars(ax, group_labels, series_labels, values, fmt="{:.1f}",
     ax.set_axisbelow(True)
 
 
+def maybe_log_y(ax, values, span: float = 30.0):
+    """
+    Log axis as soon as the spread would flatten the small bars.
+
+    Adding batch 1 to the sweep stretches the epoch-time range ~100x, and on a
+    linear axis every large-batch bar then sits on the baseline.
+    """
+    xs = [v for row in values for v in row
+          if v is not None and math.isfinite(v) and v > 0]
+    if xs and max(xs) / min(xs) > span:
+        ax.set_yscale("log")
+
+
 def bench_series(records: List[dict], batches: List[int], field: str,
                  comparable_only: bool = False):
     """
@@ -1025,10 +1217,26 @@ def plot_bench(records: List[dict], batches: List[int]):
             continue
         fig, ax = plt.subplots(figsize=(11, 5))
         grouped_bars(ax, batches, labels, values, fmt="{:.1f}", colors=colors)
+        maybe_log_y(ax, values)
         ax.set(xlabel="batch size", ylabel="time (min)",
                title=f"projected time for one epoch -- {title}")
         ax.legend(fontsize=8, ncol=2)
         save(fig, name)
+
+    # per-step time, which is the view the small batches exist for: an epoch at
+    # batch 1 is 128x more steps than at batch 128, so the epoch chart answers
+    # "which batch size finishes an epoch first", not "what does compile do to
+    # one step"
+    labels, colors, values = bench_series(records, batches, "step_s")
+    if labels:
+        ms = [[v * 1e3 for v in row] for row in values]
+        fig, ax = plt.subplots(figsize=(11, 5))
+        grouped_bars(ax, batches, labels, ms, fmt="{:.1f}", colors=colors)
+        maybe_log_y(ax, ms)
+        ax.set(xlabel="batch size", ylabel="ms per step",
+               title="time for one step (forward + backward)")
+        ax.legend(fontsize=8, ncol=2)
+        save(fig, "2b_step_time.png")
     print(f"plots -> {PLOTS_DIR}/")
 
 
@@ -1041,7 +1249,9 @@ def plot_memory(bench_records: List[dict], train_records: List[dict],
     # way, so those bars would not be on the same scale as the rest.
     for field, name, title in (
             ("peak_fwd_mb", "8_mem_peak_forward.png", "forward"),
-            ("peak_bwd_mb", "8_mem_peak_backward.png", "forward + backward")):
+            ("peak_bwd_mb", "8_mem_peak_backward.png", "forward + backward"),
+            ("peak_step_mb", "8b_mem_peak_step.png",
+             "forward + backward + AdamW step")):
         labels, colors, values = bench_series(bench_records, batches, field,
                                               comparable_only=True)
         if not labels:
@@ -1050,7 +1260,7 @@ def plot_memory(bench_records: List[dict], train_records: List[dict],
         grouped_bars(ax, batches, labels, values, fmt="{:.0f}", colors=colors)
         ax.set(xlabel="batch size", ylabel="peak allocated (MB)",
                title=f"peak memory -- {title}\n"
-                     "CUDAGraph rows excluded: private pool, not comparable")
+               "CUDAGraph rows excluded: private pool, not comparable")
         ax.legend(fontsize=8)
         save(fig, name)
 
@@ -1132,6 +1342,40 @@ def plot_train(records: List[dict]):
         save(fig, "4b_pruning_over_training.png")
 
 
+def rank_heatmap(plt, rows: List[dict], arms: List[str], field: str,
+                 vmax: float, cmap: str, title: str, fname: str):
+    """
+    layer x bond grid of `field`, one panel per arm
+    """
+    ncol = min(len(arms), 4)
+    nrow = (len(arms) + ncol - 1) // ncol
+    fig, axes = plt.subplots(nrow, ncol, figsize=(3.6 * ncol, 3.0 * nrow),
+                             squeeze=False)
+    for k, arm in enumerate(arms):
+        ax = axes[k // ncol][k % ncol]
+        mine = [r for r in rows if r["arm"] == arm]
+        layers = sorted({(r["block"], r["role"], r["layer"]) for r in mine},
+                        key=lambda l: (l[0], ROLES.index(l[1])
+                                       if l[1] in ROLES else 99))
+        nbond = max((r["bond"] for r in mine), default=0) + 1
+        grid = [[float("nan")] * nbond for _ in layers]
+        index = {lay[2]: i for i, lay in enumerate(layers)}
+        for r in mine:
+            grid[index[r["layer"]]][r["bond"]] = r[field]
+        im = ax.imshow(grid, aspect="auto", cmap=cmap, vmin=0, vmax=vmax)
+        ax.set_yticks(range(len(layers)))
+        ax.set_yticklabels([f"b{b}.{role}" for b, role, _ in layers],
+                           fontsize=6)
+        ax.set_xticks(range(nbond))
+        ax.set_xlabel("bond", fontsize=8)
+        ax.set_title(arm, fontsize=8)
+        fig.colorbar(im, ax=ax, fraction=0.04)
+    for k in range(len(arms), nrow * ncol):
+        axes[k // ncol][k % ncol].axis("off")
+    fig.suptitle(title, fontsize=11)
+    save(fig, fname)
+
+
 def plot_ranks(summaries: List[dict], rows: List[dict]):
     """
     The four views of the final rank configuration
@@ -1153,66 +1397,32 @@ def plot_ranks(summaries: List[dict], rows: List[dict]):
                  [f"lr_rank {lr:g}" for lr in lrs],
                  [[cell(lr, mr, "pruned_frac") for mr in ranks] for lr in lrs],
                  fmt="{:.2f}")
-    ax.set(ylabel="pruned fraction of total rank", ylim=(0, 1),
+    # headroom for the bar labels, which bar_label draws *above* the bar
+    ax.set(ylabel="pruned fraction of total rank", ylim=(0, 1.12),
            title="how much rank the adaptive scheme removes")
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=8, ncol=len(lrs), loc="upper center",
+              bbox_to_anchor=(0.5, -0.08))
     save(fig, "5_rank_pruned_frac.png")
 
-    # 2 -- distribution of surviving rank, normalised by the starting rank
-    fig, axes = plt.subplots(len(lrs), len(ranks), figsize=(3.2 * len(ranks),
-                                                            2.8 * len(lrs)),
-                             squeeze=False, sharex=True)
-    bins = [i / 10 for i in range(11)]
-    for i, lr in enumerate(lrs):
-        for j, mr in enumerate(ranks):
-            ax = axes[i][j]
-            kept = [r["kept_frac"] for r in rows
-                    if r["lr_rank"] == lr and r["max_rank"] == mr]
-            if kept:
-                ax.hist(kept, bins=bins, color=f"C{i}")
-            ax.set_title(f"lr {lr:g}, max_rank {mr}", fontsize=8)
-            ax.grid(alpha=0.3, axis="y")
-            if j == 0:
-                ax.set_ylabel("# bonds", fontsize=8)
-            if i == len(lrs) - 1:
-                ax.set_xlabel("surviving rank / initial", fontsize=8)
-    fig.suptitle("final rank distribution", fontsize=11)
-    save(fig, "5b_rank_hist.png")
-
-    # 3 -- where the rank actually sits: layer x bond, one panel per arm
+    # 2 -- where the rank actually sits: layer x bond, one panel per arm.
+    # Two views of the same grid, and the second is the honest one: the chain
+    # ends never start at max_rank, since get_uniform_rank clips them by the
+    # mode products (bond 0 of a (4,8,8) input is 4 whatever max_rank is), so
+    # on the absolute map every arm looks pruned at the edges when nothing was
+    # pruned there at all. kept_frac divides that structure out.
     arms = sorted({r["arm"] for r in rows})
-    ncol = min(len(arms), 4)
-    nrow = (len(arms) + ncol - 1) // ncol
-    fig, axes = plt.subplots(nrow, ncol, figsize=(3.6 * ncol, 3.0 * nrow),
-                             squeeze=False)
-    vmax = max((r["rank_final"] for r in rows), default=1) or 1
-    for k, arm in enumerate(arms):
-        ax = axes[k // ncol][k % ncol]
-        mine = [r for r in rows if r["arm"] == arm]
-        layers = sorted({(r["block"], r["role"], r["layer"]) for r in mine},
-                        key=lambda l: (l[0], ROLES.index(l[1])
-                                       if l[1] in ROLES else 99))
-        nbond = max((r["bond"] for r in mine), default=0) + 1
-        grid = [[float("nan")] * nbond for _ in layers]
-        index = {lay[2]: i for i, lay in enumerate(layers)}
-        for r in mine:
-            grid[index[r["layer"]]][r["bond"]] = r["rank_final"]
-        im = ax.imshow(grid, aspect="auto", cmap="viridis", vmin=0, vmax=vmax)
-        ax.set_yticks(range(len(layers)))
-        ax.set_yticklabels([f"b{b}.{role}" for b, role, _ in layers],
-                           fontsize=6)
-        ax.set_xticks(range(nbond))
-        ax.set_xlabel("bond", fontsize=8)
-        ax.set_title(arm, fontsize=8)
-        fig.colorbar(im, ax=ax, fraction=0.04)
-    for k in range(len(arms), nrow * ncol):
-        axes[k // ncol][k % ncol].axis("off")
-    fig.suptitle("surviving rank per layer and bond", fontsize=11)
-    save(fig, "5c_rank_heatmap.png")
+    rank_max = max((r["rank_final"] for r in rows), default=1) or 1
+    for field, vmax, cmap, title, fname in (
+            ("rank_final", rank_max, "viridis",
+             "surviving rank per layer and bond", "5c_rank_heatmap.png"),
+            ("kept_frac", 1.0, "magma",
+             "surviving rank / initial -- what the scheme actually removed",
+             "5e_rank_kept_frac.png")):
+        rank_heatmap(plt, rows, arms, field, vmax, cmap, title, fname)
 
-    # 4 -- does pruning concentrate in a particular role?
+    # 3 -- does pruning concentrate in a particular role?
     roles = ROLES
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(11, 5.6))
     values = []
     for arm in arms:
         col = []
@@ -1222,20 +1432,52 @@ def plot_ranks(summaries: List[dict], rows: List[dict]):
             col.append(sum(xs) / len(xs) if xs else float("nan"))
         values.append(col)
     grouped_bars(ax, roles, arms, values, fmt="{:.2f}")
-    ax.set(ylabel="mean surviving rank / initial", ylim=(0, 1),
+    # a bar at 1.00 plus its label needs room above it, and with 8 arms the
+    # legend does not fit inside the axes at all -- put it under them
+    ax.set(ylabel="mean surviving rank / initial", ylim=(0, 1.12),
            title="which roles keep their rank")
-    ax.legend(fontsize=7, ncol=2)
+    ax.legend(fontsize=7, ncol=4, loc="upper center",
+              bbox_to_anchor=(0.5, -0.08))
     save(fig, "5d_rank_by_role.png")
 
 
-def plot_core_diag(rows: List[dict]):
+def core_bands(ax, rows: List[dict], legend: bool = False):
+    """
+    Percentiles of one core group against training iteration.
+
+    Two nested bands (p1-p99, p25-p75) around the median: the outer one is
+    where a blow-up shows first, the inner one is where a collapse towards
+    zero shows first, and a single std curve conflates the two.
+    """
+    pts = sorted(rows, key=lambda r: r["iter"])
+    if not pts:
+        return
+    xs = [r["iter"] for r in pts]
+    lo, q1, med, q3, hi = (
+        [[r[PCT_LABEL % int(q * 100)] for r in pts]
+         for q in CORE_DIAG_QUANTILES])
+    ax.fill_between(xs, lo, hi, color="#1f77b4", alpha=0.18,
+                    label="p1-p99" if legend else None)
+    ax.fill_between(xs, q1, q3, color="#1f77b4", alpha=0.40,
+                    label="p25-p75" if legend else None)
+    ax.plot(xs, med, color="#08306b", lw=1.4,
+            label="median" if legend else None)
+    ax.axhline(0.0, color="#999999", lw=0.6, ls=":")
+    if legend:
+        ax.legend(fontsize=6)
+
+
+def plot_core_diag(rows: List[dict], dist_rows: List[dict]):
     """
     How the cores move during training: one figure per arm, one row per probed
-    block, one line per core of the CORE_DIAG_PLOT_ROLE layer.
+    block, and for the CORE_DIAG_PLOT_ROLE layer three value-distribution
+    panels (left half of the chain, the two centre cores, right half) next to
+    the per-core gradient norm and rank parameter.
 
-    Log axes wherever the quantity stays positive -- core std and gradient
-    norms span orders of magnitude along the chain, and a linear axis hides
-    exactly the collapse or blow-up this plot exists to catch.
+    Log axes wherever the quantity stays positive -- gradient norms span
+    orders of magnitude along the chain, and a linear axis hides exactly the
+    collapse or blow-up this plot exists to catch. The band panels stay
+    linear: core entries are signed and roughly symmetric about zero.
     """
     if not rows:
         return
@@ -1247,27 +1489,40 @@ def plot_core_diag(rows: List[dict]):
             continue
         blocks = sorted({r["block"] for r in mine})
         ncores = max(r["core"] for r in mine) + 1
+        dmine = [r for r in dist_rows
+                 if r["arm"] == arm and r["role"] == CORE_DIAG_PLOT_ROLE]
+        panels = CORE_DIST_GROUPS + CORE_DIAG_FIELDS
         cmap = plt.get_cmap("viridis")
         fig, axes = plt.subplots(
-            len(blocks), len(CORE_DIAG_FIELDS),
-            figsize=(3.4 * len(CORE_DIAG_FIELDS), 2.6 * len(blocks)),
+            len(blocks), len(panels),
+            figsize=(3.2 * len(panels), 2.6 * len(blocks)),
             squeeze=False, sharex=True)
         for i, b in enumerate(blocks):
-            for j, (field, title, logy) in enumerate(CORE_DIAG_FIELDS):
+            for j, panel in enumerate(panels):
                 ax = axes[i][j]
-                positive = True
-                for c in range(ncores):
-                    pts = sorted((r["iter"], r[field]) for r in mine
-                                 if r["block"] == b and r["core"] == c)
-                    ys = [y for _, y in pts if math.isfinite(y)]
-                    if not ys:
-                        continue
-                    positive = positive and all(y > 0 for y in ys)
-                    ax.plot([x for x, _ in pts], [y for _, y in pts],
-                            color=cmap(c / max(ncores - 1, 1)), lw=1.2,
-                            label=f"core {c}" if (i, j) == (0, 0) else None)
-                if logy and positive and ax.lines:
-                    ax.set_yscale("log")
+                if len(panel) == 2:      # band panel: a group's percentiles
+                    group, title = panel
+                    core_bands(ax, [r for r in dmine
+                                    if r["block"] == b
+                                    and r["group"] == group],
+                               legend=(i, j) == (0, 0))
+                else:                    # line panel: one line per core
+                    field, title, logy = panel
+                    positive = True
+                    for c in range(ncores):
+                        pts = sorted((r["iter"], r[field]) for r in mine
+                                     if r["block"] == b and r["core"] == c)
+                        ys = [y for _, y in pts if math.isfinite(y)]
+                        if not ys:
+                            continue
+                        positive = positive and all(y > 0 for y in ys)
+                        ax.plot([x for x, _ in pts], [y for _, y in pts],
+                                color=cmap(c / max(ncores - 1, 1)), lw=1.2,
+                                label=f"core {c}" if i == 0 else None)
+                    if logy and positive and ax.lines:
+                        ax.set_yscale("log")
+                    if i == 0 and ax.lines:
+                        ax.legend(fontsize=6, ncol=2)
                 ax.grid(alpha=0.3)
                 if i == 0:
                     ax.set_title(title, fontsize=9)
@@ -1275,8 +1530,6 @@ def plot_core_diag(rows: List[dict]):
                     ax.set_ylabel(f"block {b}", fontsize=9)
                 if i == len(blocks) - 1:
                     ax.set_xlabel("iteration", fontsize=8)
-        if axes[0][0].lines:
-            axes[0][0].legend(fontsize=6, ncol=2)
         fig.suptitle(f"{arm} -- {CORE_DIAG_PLOT_ROLE} cores through training",
                      fontsize=11)
         save(fig, f"6_cores_{arm}.png")
@@ -1327,6 +1580,23 @@ def summarize(bench: List[dict], train: List[dict], summaries: List[dict],
                       f"{e['epoch_total_min']/g['epoch_total_min']:.2f}x"
                       + (f", still {g['epoch_total_min']/d['epoch_total_min']:.2f}x "
                          f"dense-eager" if d else ""))
+
+        # where the parameter saving actually shows up: activations scale with
+        # tokens per step, parameters + AdamW states do not, so the tensorized
+        # win only surfaces at the small-batch end
+        print("\npeak memory of a full step (fwd + bwd + AdamW), eager rows")
+        for b in batches:
+            d = next((r for r in bench if r["kind"] == "dense"
+                      and r["compile_mode"] == "eager" and r["batch"] == b), None)
+            e = next((r for r in bench if r["kind"] == "tensorized"
+                      and r["compile_mode"] == "eager" and r["batch"] == b), None)
+            if not (d and e and d.get("peak_step_mb") and e.get("peak_step_mb")):
+                continue
+            print(f"      batch {b:>4d}: dense {d['peak_step_mb']:7.1f} MB "
+                  f"(params+states {d['param_mb']+d.get('opt_state_mb', 0):6.1f})"
+                  f"   tensorized {e['peak_step_mb']:7.1f} MB "
+                  f"(params+states {e['param_mb']+e.get('opt_state_mb', 0):6.1f})"
+                  f"   {e['peak_step_mb']/d['peak_step_mb']:.2f}x")
 
     if train:
         print("\nquality vs size")
@@ -1411,7 +1681,8 @@ def main():
                     help="scaled: cores sized so the contracted matrix has "
                          "std 0.02; normal: literal standard normal")
     ap.add_argument("--batches", nargs="*", type=int, default=None,
-                    help="batch sizes for the benchmark (default 32 64 128)")
+                    help="batch sizes for the benchmark "
+                         "(default 1 8 32 64 128)")
     ap.add_argument("--bench-rank", type=int, default=BENCH_MAX_RANK,
                     help="max_rank of the tensorized model in the benchmark")
     ap.add_argument("--bench-reps", type=int, default=None)
@@ -1450,6 +1721,25 @@ def main():
                     choices=ROLES,
                     help="which TT role the per-arm core figure draws. Every "
                          "probed role is written to core_stats.csv regardless")
+    ap.add_argument("--track", default="off",
+                    choices=list(tracking.BACKENDS),
+                    help="live experiment tracking: one run per training arm "
+                         "(loss and perplexity curves), one for the benchmark "
+                         "sweep, one for the final plots and tables. "
+                         "tensorboard writes to <out>/tb/<group>/")
+    ap.add_argument("--wandb-project", default=tracking.PROJECT)
+    ap.add_argument("--wandb-entity", default=None,
+                    help="wandb only: team/user the runs belong to")
+    ap.add_argument("--wandb-mode", default="online",
+                    choices=["online", "offline", "disabled"],
+                    help="wandb only: offline writes to <out>/wandb for a "
+                         "later `wandb sync`; that is also the fallback "
+                         "when no API key is available, since an interactive "
+                         "login prompt would hang a colab `!python` job")
+    ap.add_argument("--wandb-group", default=None,
+                    help="name tying this invocation's runs together: a "
+                         "wandb group, or the <out>/tb subdirectory "
+                         "(default: a timestamp)")
     ap.add_argument("--progress", action="store_true",
                     help="show per-iteration tqdm bars (off by default)")
     ap.add_argument("--quiet", action="store_true",
@@ -1499,6 +1789,12 @@ def main():
         for name in ("torch._inductor", "torch._dynamo", "torch._functorch"):
             logging.getLogger(name).setLevel(logging.ERROR)
 
+    track = tracking.configure(
+        backend=args.track, dir=RESULTS,
+        group=args.wandb_group or tracking.session_group(),
+        project=args.wandb_project, entity=args.wandb_entity,
+        mode=args.wandb_mode)
+
     device = get_device()
     t.manual_seed(cfg.seed)
     ds = CharDataset()
@@ -1510,6 +1806,12 @@ def main():
     if args.arms:
         arms = [a for a in arms if a.name in args.arms]
 
+    if track.backend == "tensorboard":
+        print(f"tensorboard: {tracking.log_dir()}\n"
+              f"  tensorboard --logdir {os.path.join(RESULTS, tracking.TB_SUBDIR)}")
+    elif track.backend == "wandb":
+        print(f"wandb: project={track.project} group={track.group} "
+              f"mode={track.mode}")
     print(f"device={device}  init_std={cfg.init_std}  "
           f"n_layer={cfg.n_layer} n_embd={cfg.n_embd} "
           f"block={cfg.block_size} iters={cfg.max_iters}")
@@ -1540,6 +1842,7 @@ def main():
     rank_all: List[dict] = []
     summaries: List[dict] = []
     core_all: List[dict] = []
+    core_dist_all: List[dict] = []
     if train:
         train = decorate_train(train)
         train.sort(key=lambda r: (r["kind"] != "dense", r["family"],
@@ -1550,9 +1853,13 @@ def main():
 
         for r in train:
             core_all.extend(core_rows(r))
+            core_dist_all.extend(core_rows(r, "core_dist"))
         if core_all:
             write_csv(os.path.join(TABLES_DIR, "core_stats.csv"), core_all,
                       CORE_COLUMNS)
+        if core_dist_all:
+            write_csv(os.path.join(TABLES_DIR, "core_dist.csv"), core_dist_all,
+                      CORE_DIST_COLUMNS)
 
         for r in train:
             if r["kind"] != "adaptive":
@@ -1577,8 +1884,11 @@ def main():
                  "memory_comparable": r["memory_comparable"]}
                 for r in train]
     mem_rows += [{"scope": "bench", "name": r["label"], "batch": r["batch"],
-                  "param_mb": r["param_mb"], "peak_fwd_mb": r["peak_fwd_mb"],
+                  "param_mb": r["param_mb"],
+                  "opt_state_mb": r.get("opt_state_mb"),
+                  "peak_fwd_mb": r["peak_fwd_mb"],
                   "peak_bwd_mb": r["peak_bwd_mb"],
+                  "peak_step_mb": r.get("peak_step_mb"),
                   "memory_comparable": r["memory_comparable"]}
                  for r in bench]
     if mem_rows:
@@ -1593,9 +1903,21 @@ def main():
             plot_train(train)
         plot_memory(bench, train, batches)
         plot_ranks(summaries, rank_all)
-        plot_core_diag(core_all)
+        plot_core_diag(core_all, core_dist_all)
     except Exception as e:
         print(f"plotting failed: {type(e).__name__}: {e}")
+
+    if track.backend != "off":
+        with tracking.Run("report", "report", tags=["report"],
+                          config={"phase": "report"}) as rep:
+            rep.images(sorted(glob.glob(os.path.join(PLOTS_DIR, "*.png"))))
+            rep.artifact("tables", "results",
+                         sorted(glob.glob(os.path.join(TABLES_DIR, "*.csv"))))
+            for r in train:
+                rep.summary({f"val_ppl/{r['arm']}": r["final_val_ppl"],
+                             f"params/{r['arm']}": r["effective_params"]})
+            if rep.url:
+                print(f"report run: {rep.url}")
 
     summarize(bench, train, summaries, core_all, batches)
 
