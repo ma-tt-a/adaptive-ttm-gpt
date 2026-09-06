@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from utils import TTMatVec, build_cores_gaus
+from utils import TTMatVec, build_cores_gauss, get_xavier_std, get_uniform_rank
 from typing import List
 import torch as t
 import torch.nn as nn
@@ -14,6 +14,13 @@ class TTLinearConfig:
     threshold: float = 1e-2
     adaptive: bool = True
     bias: bool = True
+    init_std: float = 2e-2  # std of the contracted matrix, not of the cores
+
+    @classmethod
+    def from_max_rank(cls, in_shape: t.Size, out_shape: t.Size,
+                      max_rank: int, **kwargs):
+        rank = get_uniform_rank(in_shape, out_shape, max_rank)
+        return cls(in_shape=in_shape, out_shape=out_shape, rank=rank, **kwargs)
 
     def __post_init__(self):
         self.N = len(self.in_shape) + len(self.out_shape)
@@ -36,9 +43,9 @@ class TTLinear(nn.Module):
     def _build_cores(self) -> List[nn.Parameter]:
         rank = self.cfg.rank
         shape = self.cfg.in_shape + self.cfg.out_shape
-        # res = [nn.Parameter(core) for core in build_cores_gaus(shape, rank)]
+        std = get_xavier_std(rank, self.cfg.init_std)
         res = [nn.Parameter(core)
-               for core in build_cores_gaus(shape, rank)]
+               for core in build_cores_gauss(shape, rank, std)]
         return res
 
     def _build_rank(self) -> List[nn.Parameter]:
@@ -68,6 +75,28 @@ class TTLinear(nn.Module):
         res.append(self.cores[-1])
         return res
 
+    def effective_rank(self) -> List[int]:
+        """
+        Surviving TT-ranks, i.e. rank entries above the threshold
+        """
+        if not self.cfg.adaptive:
+            return list(self.cfg.rank[1:-1])
+        threshold = self.cfg.threshold
+        return [int(t.sum(x > threshold)) for x in self.rank_params]
+
+    def effective_size(self) -> int:
+        """
+        # core parameters implied by the surviving ranks
+        """
+        R = [1] + self.effective_rank() + [1]
+        if any(r == 0 for r in R):
+            return 0
+        return sum(G.shape[1] * R[n] * R[n + 1]
+                   for n, G in enumerate(self.cores))
+
     def forward(self, X):
-        out = TTMatVec.apply(X, *self.get_cores())
+        # TTMatVec is a matrix product: fold any leading dims into the batch
+        sh = X.shape
+        Y = TTMatVec.apply(X.reshape(-1, sh[-1]), *self.get_cores())
+        out = Y.reshape(sh[:-1] + (self.J,))
         return out + self.bias if self.cfg.bias else out
