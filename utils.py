@@ -34,15 +34,60 @@ def tt_2_matrix(cores: List[t.Tensor]):
     return X.reshape(sh[:d+1].numel(), sh[d+1:].numel())
 
 
-def build_cores_gaus(shape: t.Size, rank: t.Size):
+def build_cores_gauss(shape: t.Size, rank: t.Size, std: float = 1.0):
     """
-    Initialize TT cores with given shape and ranks from standard normal
+    Initialize TT cores with given shape and ranks from a centered normal
     """
     N = len(shape)
     cores = []
     for n in range(1, N + 1):
-        cores.append(t.randn(rank[n-1], shape[n-1], rank[n]))
+        cores.append(std * t.randn(rank[n-1], shape[n-1], rank[n]))
     return cores
+
+
+def get_xavier_std(rank: t.Size, target_std: float):
+    """
+    Core std such that the contracted matrix has entries with std target_std.
+
+    Var(W) = prod(rank) * std ** (2N).
+    """
+    N = len(rank) - 1
+    R = 1
+    for r in rank[1:-1]:
+        R *= r
+    return (target_std ** 2 / R) ** (1 / (2 * N))
+
+
+def get_uniform_rank(in_shape: t.Size, out_shape: t.Size, max_rank: int) -> t.Size:
+    """
+    Uniform TT-rank.
+    Clipped with max_rank and R_i <= I_1 x ... x I_i, R_i <= I_i+1 x ... x I_2d
+    """
+    dims = in_shape + out_shape
+    N = len(dims)
+    rank = [1]
+    for n in range(1, N):
+        rank.append(min(max_rank, dims[:n].numel(), dims[n:].numel()))
+    rank.append(1)
+    return t.Size(rank)
+
+
+def get_device():
+    """
+    Pick the available accelerator: cuda (colab), xpu (local intel), else cpu
+    """
+    if t.cuda.is_available():
+        return t.device("cuda")
+    if hasattr(t, "xpu") and t.xpu.is_available():
+        return t.device("xpu")
+    return t.device("cpu")
+
+
+def device_module(device: t.device):
+    """
+    torch.cuda / torch.xpu for the given device, or None on cpu
+    """
+    return getattr(t, device.type, None) if device.type != "cpu" else None
 
 
 def tt_svd(X: t.Tensor):
