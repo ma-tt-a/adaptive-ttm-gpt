@@ -1,5 +1,9 @@
 torch
+numpy
 tqdm
 matplotlib
 tensorboard
 wandb
+tiktoken
+huggingface-hub
+pyarrow

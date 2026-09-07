@@ -30,7 +30,27 @@ TT_SHAPES_64 = {
     "mlp_proj": (t.Size([4, 4, 16]), t.Size([4, 4, 4])),  # 256 -> 64
 }
 
-TT_SHAPES = {256: TT_SHAPES_256, 64: TT_SHAPES_64}
+# gpt2-small width, n_embd = 768; d = 3, so 6 cores
+TT_SHAPES_768 = {
+    "c_attn": (t.Size([8, 8, 12]), t.Size([12, 12, 16])),   # 768 -> 2304
+    "attn_proj": (t.Size([8, 8, 12]), t.Size([8, 8, 12])),  # 768 -> 768
+    "c_fc": (t.Size([8, 8, 12]), t.Size([12, 16, 16])),     # 768 -> 3072
+    "mlp_proj": (t.Size([12, 16, 16]), t.Size([8, 8, 12])),  # 3072 -> 768
+}
+
+TT_SHAPES = {768: TT_SHAPES_768, 256: TT_SHAPES_256, 64: TT_SHAPES_64}
+
+# named model sizes. The values are exactly the fields TrainConfig carries, so
+# a preset is applied by setattr and nothing else knows about it. "base" is the
+# harness default spelled out, so selecting it changes no cache key.
+MODEL_PRESETS = {
+    "smoke": dict(n_layer=2, n_head=4, n_embd=64, block_size=64),
+    "base": dict(n_layer=6, n_head=8, n_embd=256, block_size=128),
+    # radford et al. 2019, 124M parameters: 12 layers, 12 heads, 768 wide,
+    # 1024 context. With the gpt2 tokenizer (vocab 50257) this is gpt2-small
+    # as published -- the TT arms replace the 4 linears per block, nothing else
+    "gpt2-small": dict(n_layer=12, n_head=12, n_embd=768, block_size=1024),
+}
 
 
 @dataclass
