@@ -6,6 +6,17 @@ python run_experiments.py --phases bench # phase 1 only: cheap, run this first
 python run_experiments.py                # the full protocol
 ```
 
+For memory numbers, run phase 1 once per model instead, so nothing one measurement leaves behind is
+charged to the next:
+
+```bash
+python run_experiments.py --phases bench --kinds dense
+python run_experiments.py --phases bench --kinds tensorized
+```
+
+The second invocation reads the first one's cells from the cache, so the plots and tables still carry
+both.
+
 Locally the interpreter is `.venv/Scripts/python.exe`; in Colab it is plain `python`.
 
 ## Flags
@@ -92,12 +103,22 @@ choice, and `--data-tokens` is cheaper than an extra epoch.
 | `--compile-modes eager compile cudagraph` | all three | which of the three modes to measure. `compile` is inductor fusion, `cudagraph` is fusion + CUDA Graphs (a no-op on xpu). |
 | `--bench-rank N` | `32` | `max_rank` of the tensorized model being benchmarked. |
 | `--bench-reps N` | `30` (smoke `5`) | timed forward/backward repetitions per cell, after 5 warmup steps (2 in smoke). |
+| `--kinds dense tensorized` | both | which models phase 1 may **compute**. The other kind is still read from the cache, so the plots keep both series either way — `--kinds dense` then `--kinds tensorized`, in two invocations, gives each model a process of its own. That is the only way to a memory number nothing else is holding: dynamo caches and CUDA-Graph pools do not survive an exit, whatever they survive inside one run. |
 
-The memory pass of a bench cell runs a **full training step with AdamW**, kept separate from the
-timing pass (which stays forward/backward only — that is the CoMERA figure). Two states per parameter
-is exactly the part of the tensorized saving that forward/backward alone cannot show, while the extra
-intermediate `TTMatVec` saves (`X` *and* `T_1`) is charged either way. Measured at `n_embd=256`,
-6 layers, eager, peak of a full step:
+The memory pass of a bench cell measures **three scenarios**, kept separate from the timing pass
+(which stays forward/backward only — that is the CoMERA figure). Each peak is an absolute
+`max_memory_allocated`; what makes it mean what its name says is what is alive at its
+`reset_peak_memory_stats`, which starts the peak at the current allocation rather than at zero:
+
+| column | scenario | resident when the peak is taken |
+|---|---|---|
+| `peak_infer_mb` | inference forward | weights + transient activations. Measured under `model.eval()` + `no_grad`, **before the optimizer is created** — there is no way to take a forward peak once AdamW's states exist. Deliberately not a prefix of the two below. |
+| `peak_bwd_mb` | training, forward + backward | weights + AdamW states + gradients + saved activations |
+| `peak_step_mb` | the full training step | the above + AdamW's `_foreach_` temporaries. The honest comparison. |
+
+Two states per parameter is exactly the part of the tensorized saving that forward/backward alone
+cannot show, while the extra intermediate `TTMatVec` saves (`X` *and* `T_1`) is charged either way.
+Measured at `n_embd=256`, 6 layers, eager, peak of a full step:
 
 | batch | dense | tensorized | ratio |
 |---|---|---|---|
@@ -258,7 +279,7 @@ be mistaken for a full one.
 
 | file | contents |
 |---|---|
-| `tables/bench.csv` | per configuration and batch: fwd/bwd step time, projected minutes per epoch, peak memory (fwd / fwd+bwd / fwd+bwd+AdamW step), optimizer-state size, compile diagnostics |
+| `tables/bench.csv` | per configuration and batch: fwd/bwd step time, projected minutes per epoch, peak memory (inference / fwd+bwd / fwd+bwd+AdamW step), optimizer-state size, compile diagnostics |
 | `tables/train.csv` | per arm: effective params, compression, val loss/ppl, step time, memory |
 | `tables/ranks.csv` | one row per arm x TT layer x bond: initial and final rank |
 | `tables/rank_summary.csv` | per adaptive arm: `pruned_frac`, mean/min/max rank, dead bonds |
@@ -272,7 +293,7 @@ be mistaken for a full one.
 | `plots/5_rank_pruned_frac.png`, `5c_rank_heatmap.png`, `5d_rank_by_role.png` | final rank configuration |
 | `plots/5e_rank_kept_frac.png` | same layer x bond grid as `5c`, but `kept_frac` instead of the absolute rank. Read this one to judge pruning: the chain ends never start at `max_rank` (`get_uniform_rank` clips them by the mode products), so on the absolute map every arm looks pruned at the edges when nothing was pruned there. |
 | `plots/6_cores_<arm>.png` | one figure per arm, one row per probed block: three percentile-band panels for the core values (left half of the chain, the two centre cores, right half), then the per-core gradient norm and rank-parameter mean (log axes wherever the quantity stays positive) |
-| `plots/7_mem_static.png`, `8_mem_peak_{forward,backward}.png`, `8b_mem_peak_step.png` | memory footprint. `8b` is the one to read: it includes the AdamW states, i.e. the half of the tensorized saving a fwd+bwd measurement never sees |
+| `plots/7_mem_static.png`, `8_mem_peak_{inference,backward}.png`, `8b_mem_peak_step.png` | memory footprint. `8b` is the one to read for training: it includes the AdamW states, i.e. the half of the tensorized saving a fwd+bwd measurement never sees. `8_mem_peak_inference.png` is the deployment-side number instead — no states, no gradients |
 
 ## Reading the warnings
 

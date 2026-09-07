@@ -114,8 +114,11 @@ BENCH_REPS = 30      # capture are out of the way
 # 3: cells are isolated from each other (release_cell), which every recorded
 # peak before it was measured on top of whatever the previous cells left alive.
 # 4: peaks are deltas over the baseline plus the exact resident sizes, since
-# release_cell does not in fact free the cudagraph cells' captured graphs
-BENCH_PROTOCOL = 4
+# release_cell does not in fact free the cudagraph cells' captured graphs.
+# 5: three named scenarios measured absolutely -- peak_fwd, which silently
+# carried the AdamW states, is now peak_infer and is taken under no_grad
+# before the optimizer exists
+BENCH_PROTOCOL = 5
 
 # phase 2
 UNIFORM_RANKS = [4, 8, 16, 32]
@@ -442,9 +445,12 @@ def cached_or_compute(path: str, want: str, compute, force: bool, tag: str,
     Read a cached record, or compute it when its phase is selected.
 
     allowed=False is how phases 3/4 read the phase-1/2 results without ever
-    triggering compute.
+    triggering compute -- and how a --kinds run reads back the kind it is not
+    computing. force only applies to a cell that is allowed to compute: a
+    forced recomputation of one selection must not blank out everything
+    outside it, which is what dropping the cached record would do.
     """
-    if os.path.exists(path) and not force:
+    if os.path.exists(path) and not (force and allowed):
         try:
             with open(path, encoding="utf-8") as f:
                 rec = json.load(f)
@@ -594,12 +600,16 @@ def bench_cell(kind: str, mode: Optional[str], batch: int, cfg: TrainConfig,
     # memory pass, kept apart from the timing pass because
     # reset_peak_memory_stats/empty_cache perturb the numbers above.
     #
-    # The optimizer is part of it on purpose. AdamW keeps two states per
-    # parameter, so fwd+bwd alone charges the tensorized model for the extra
-    # intermediate TTMatVec saves (X *and* T_1) while crediting it for only
-    # half of what it saves on the parameter side -- the comparison it loses
-    # is not the one training actually pays. Same three-way split as phase 2,
-    # so the two phases measure the same optimizer.
+    # Three scenarios, not three points on one curve. Each peak is absolute,
+    # and what makes it mean what its name says is what is alive at its
+    # reset_memory: reset_peak_memory_stats starts the peak at whatever is
+    # currently allocated, so the resident half of each answer is included by
+    # construction and the ordering of the two passes is the measurement.
+    #
+    #   peak_infer  weights + transient activations
+    #   peak_bwd    weights + AdamW states + gradients + saved activations
+    #   peak_step   the above + AdamW's _foreach_ temporaries
+    #
     # the timing loop's last graph is still reachable through loss; a cycle,
     # so refcounting alone does not collect it. _dynamo.reset() is deliberately
     # not called here -- model may be the compiled wrapper this cell measures
@@ -607,6 +617,28 @@ def bench_cell(kind: str, mode: Optional[str], batch: int, cfg: TrainConfig,
     gc.collect()
     reset_memory(device)
 
+    # inference, and it has to run first: after make_optimizer and one step
+    # the AdamW states exist, and there is no way to take a forward peak
+    # without them. no_grad is the point of the scenario -- nothing is kept
+    # for a backward that is not coming
+    peak_infer = 0
+    model.eval()
+    with t.no_grad():
+        # a compiled model builds a second graph for the no_grad path, so the
+        # first call here is a compile, not a forward
+        model(X, Y)
+        for _ in range(2):
+            reset_memory(device)
+            model(X, Y)
+            peak_infer = max(peak_infer, peak_memory(device))
+    model.train()
+
+    # training. The optimizer is part of it on purpose: AdamW keeps two states
+    # per parameter, so fwd+bwd alone charges the tensorized model for the
+    # extra intermediate TTMatVec saves (X *and* T_1) while crediting it for
+    # only half of what it saves on the parameter side -- the comparison it
+    # loses is not the one training actually pays. Same three-way split as
+    # phase 2, so the two phases measure the same optimizer.
     opt = comera.make_optimizer(raw_model)
     # Adam allocates exp_avg/exp_avg_sq lazily on the first step; that
     # allocation belongs to the steady state, not to the measured peak
@@ -615,35 +647,21 @@ def bench_cell(kind: str, mode: Optional[str], batch: int, cfg: TrainConfig,
     loss.backward()
     opt.step()
 
-    # measured against the baseline rather than absolutely. reset_peak_memory_
-    # stats starts the peak at whatever is live, which is this model plus its
-    # states plus whatever earlier cells still hold; subtracting `base` removes
-    # all three, and the two terms that belong here are added back from their
-    # exact sizes. So the reported number is what a fresh process would peak
-    # at, whoever else is holding memory in this one -- and release_cell no
-    # longer has to succeed at freeing everything for the row to be right.
-    # Gradients are outside the baseline (zero_grad above), so they are counted
-    # where they belong: in the transient.
-    peak_fwd = peak_bwd = peak_step = 0
+    peak_bwd = peak_step = 0
     for _ in range(2):
+        # gradients are freed before the reset, so they are charged to the
+        # backward that allocates them rather than being resident already
         opt.zero_grad(set_to_none=True)
         reset_memory(device)
-        base = allocated_memory(device)
         _, loss = model(X, Y)
-        peak_fwd = max(peak_fwd, peak_memory(device) - base)
         loss.backward()
-        peak_bwd = max(peak_bwd, peak_memory(device) - base)  # over fwd+bwd
+        peak_bwd = max(peak_bwd, peak_memory(device))
         opt.step()
-        peak_step = max(peak_step, peak_memory(device) - base)  # + the update
+        peak_step = max(peak_step, peak_memory(device))   # + the update
     opt_state_bytes = sum(v.numel() * v.element_size()
                           for st in opt.state.values() for v in st.values()
                           if t.is_tensor(v))
     opt.zero_grad(set_to_none=True)
-
-    resident = param_bytes + opt_state_bytes   # what `base` held of our own
-    peak_fwd += resident
-    peak_bwd += resident
-    peak_step += resident
 
     steps_per_epoch = max(1, len(ds.splits["train"]) //
                           (batch * cfg.block_size))
@@ -665,10 +683,10 @@ def bench_cell(kind: str, mode: Optional[str], batch: int, cfg: TrainConfig,
         "epoch_fwd_min": fwd_s * steps_per_epoch / 60,
         "epoch_bwd_min": bwd_s * steps_per_epoch / 60,
         "epoch_total_min": (fwd_s + bwd_s) * steps_per_epoch / 60,
-        "peak_fwd_bytes": peak_fwd,
+        "peak_infer_bytes": peak_infer,
         "peak_bwd_bytes": peak_bwd,
         "peak_step_bytes": peak_step,
-        "peak_fwd_mb": peak_fwd / 1e6,
+        "peak_infer_mb": peak_infer / 1e6,
         "peak_bwd_mb": peak_bwd / 1e6,
         "peak_step_mb": peak_step / 1e6,
         "param_bytes": param_bytes,
@@ -695,7 +713,7 @@ def bench_cell(kind: str, mode: Optional[str], batch: int, cfg: TrainConfig,
 def run_bench(cfg: TrainConfig, ds: data.Dataset, device: t.device,
               batches: List[int], modes: List[Optional[str]], max_rank: int,
               reps: int, warmup: int, force: bool,
-              allowed: bool) -> List[dict]:
+              allowed: bool, kinds: List[str]) -> List[dict]:
     records = []
     # one run for the whole sweep: a bench cell is a handful of numbers, not a
     # time series, so the useful artefact is the table plus flat summaries
@@ -703,9 +721,17 @@ def run_bench(cfg: TrainConfig, ds: data.Dataset, device: t.device,
                        config={**asdict(cfg), "phase": "bench",
                                "device": str(device), "batches": batches,
                                "bench_rank": max_rank, "reps": reps,
-                               "warmup": warmup,
+                               "warmup": warmup, "kinds": kinds,
                                "modes": [MODE_TAG[m] for m in modes]})
-    cells = [(k, m, b) for k in BENCH_KINDS for m in modes for b in batches]
+    # mode-major: the reduce-overhead cells keep a CUDA-Graph private pool that
+    # _dynamo.reset() does not hand back, so they run last and there is nothing
+    # left for a later cell to inherit. Kind-major put them in the middle,
+    # which is how every tensorized peak came to be measured on top of them
+    cells = [(k, m, b) for m in modes for k in kinds for b in batches]
+    # every kind is still read back, so a dense-only invocation re-plots the
+    # tensorized series from the cache instead of dropping it off the chart
+    cells += [(k, m, b) for m in modes for k in BENCH_KINDS
+              if k not in kinds for b in batches]
     for kind, mode, batch in tqdm(cells, desc="bench", disable=BAR_DISABLE):
         tag = f"{kind}_{MODE_TAG[mode]}_b{batch}"
         want = hash_payload(kind, MODE_TAG[mode], batch, max_rank,
@@ -716,7 +742,7 @@ def run_bench(cfg: TrainConfig, ds: data.Dataset, device: t.device,
             path, want,
             lambda k=kind, m=mode, b=batch: bench_cell(
                 k, m, b, cfg, ds, device, max_rank, reps, warmup),
-            force, tag, allowed)
+            force, tag, allowed and kind in kinds)
         if rec is None:
             continue
         records.append(rec)
@@ -1284,13 +1310,13 @@ def markdown_table(rows: List[dict], columns: List[str],
 
 BENCH_COLUMNS = ["label", "kind", "compile_mode", "batch", "fwd_s", "bwd_s",
                  "epoch_fwd_min", "epoch_bwd_min", "epoch_total_min",
-                 "peak_fwd_mb", "peak_bwd_mb", "peak_step_mb", "param_mb",
+                 "peak_infer_mb", "peak_bwd_mb", "peak_step_mb", "param_mb",
                  "opt_state_mb", "memory_comparable",
                  "first_step_s", "compiled_frames", "graph_breaks",
                  "cudagraph_skips"]
 BENCH_FMT = {"fwd_s": ".5f", "bwd_s": ".5f", "epoch_fwd_min": ".2f",
              "epoch_bwd_min": ".2f", "epoch_total_min": ".2f",
-             "peak_fwd_mb": ".1f", "peak_bwd_mb": ".1f",
+             "peak_infer_mb": ".1f", "peak_bwd_mb": ".1f",
              "peak_step_mb": ".1f", "param_mb": ".2f", "opt_state_mb": ".2f",
              "first_step_s": ".2f"}
 
@@ -1328,10 +1354,11 @@ CORE_DIST_COLUMNS = (["arm", "family", "iter", "layer", "block", "role",
                      + [PCT_LABEL % int(q * 100) for q in CORE_DIAG_QUANTILES])
 
 MEMORY_COLUMNS = ["scope", "name", "batch", "param_mb", "effective_param_mb",
-                  "opt_state_mb", "peak_fwd_mb", "peak_bwd_mb", "peak_step_mb",
+                  "opt_state_mb", "peak_infer_mb", "peak_bwd_mb",
+                  "peak_step_mb",
                   "memory_comparable"]
 MEMORY_FMT = {"param_mb": ".2f", "effective_param_mb": ".2f",
-              "opt_state_mb": ".2f", "peak_fwd_mb": ".1f",
+              "opt_state_mb": ".2f", "peak_infer_mb": ".1f",
               "peak_bwd_mb": ".1f", "peak_step_mb": ".1f"}
 
 
@@ -1469,10 +1496,12 @@ def plot_memory(bench_records: List[dict], train_records: List[dict],
     # allocate from a private pool max_memory_allocated does not see the same
     # way, so those bars would not be on the same scale as the rest.
     for field, name, title in (
-            ("peak_fwd_mb", "8_mem_peak_forward.png", "forward"),
-            ("peak_bwd_mb", "8_mem_peak_backward.png", "forward + backward"),
+            ("peak_infer_mb", "8_mem_peak_inference.png",
+             "inference forward -- weights + activations, no_grad"),
+            ("peak_bwd_mb", "8_mem_peak_backward.png",
+             "training step -- forward + backward"),
             ("peak_step_mb", "8b_mem_peak_step.png",
-             "forward + backward + AdamW step")):
+             "training step -- forward + backward + AdamW update")):
         labels, colors, values = bench_series(bench_records, batches, field,
                                               comparable_only=True)
         if not labels:
@@ -1918,6 +1947,14 @@ def main():
                     default=["eager", "compile", "cudagraph"],
                     choices=["eager", "compile", "cudagraph"],
                     help="which of the three benchmark modes to run")
+    ap.add_argument("--kinds", nargs="+", default=list(BENCH_KINDS),
+                    choices=list(BENCH_KINDS),
+                    help="which models phase 1 may *compute*; the other one "
+                         "is still read from the cache, so the plots keep "
+                         "both series. One kind per process is the way to a "
+                         "memory number nothing else in the process is "
+                         "holding: dynamo caches and CUDA-Graph pools do not "
+                         "survive an exit, whatever they survive inside one")
     ap.add_argument("--train-compile-mode",
                     choices=["eager", "compile", "cudagraph"],
                     default=None,
@@ -2133,14 +2170,17 @@ def main():
     print(f"data={corpus} vocab={ds.vocab_size}  "
           f"lr={cfg.lr:g} (cores {cfg.lr_tensor:g})  "
           f"warmup={cfg.warmup_iters}")
-    print(f"phase 1: {len(BENCH_KINDS)*len(modes)} configs x {len(batches)} "
-          f"batches (rank {bench_rank})")
+    print(f"phase 1: {len(args.kinds)*len(modes)} configs x {len(batches)} "
+          f"batches (rank {bench_rank})"
+          + ("" if len(args.kinds) == len(BENCH_KINDS)
+             else f" -- computing {'/'.join(args.kinds)} only, the rest "
+                  "read from the cache"))
     print(f"phase 2: {len(arms)} arms, tensorized compiled with "
           f"'{args.train_compile_mode}'\n")
 
     print("phase 1 -- benchmark")
     bench = run_bench(cfg, ds, device, batches, modes, bench_rank, reps,
-                      warmup, args.force, "bench" in args.phases)
+                      warmup, args.force, "bench" in args.phases, args.kinds)
 
     print("\nphase 2 -- training")
     if "train" in args.phases:
@@ -2206,7 +2246,7 @@ def main():
     mem_rows += [{"scope": "bench", "name": r["label"], "batch": r["batch"],
                   "param_mb": r["param_mb"],
                   "opt_state_mb": r.get("opt_state_mb"),
-                  "peak_fwd_mb": r["peak_fwd_mb"],
+                  "peak_infer_mb": r["peak_infer_mb"],
                   "peak_bwd_mb": r["peak_bwd_mb"],
                   "peak_step_mb": r.get("peak_step_mb"),
                   "memory_comparable": r["memory_comparable"]}
