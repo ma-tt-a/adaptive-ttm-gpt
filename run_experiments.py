@@ -34,6 +34,7 @@ measured once, across batch sizes; quality is measured once, compiled only.
 """
 import argparse
 import csv
+import gc
 import glob
 import hashlib
 import json
@@ -109,8 +110,10 @@ BENCH_WARMUP = 5     # steps paid before timing, so the JIT and the CUDA-Graph
 BENCH_REPS = 30      # capture are out of the way
 # bumped whenever a bench cell measures something different under the same
 # flags, so stale cells recompute instead of being silently mixed in with new
-# ones. 2: the memory pass runs a full AdamW step, states included
-BENCH_PROTOCOL = 2
+# ones. 2: the memory pass runs a full AdamW step, states included.
+# 3: cells are isolated from each other (release_cell), which every recorded
+# peak before it was measured on top of whatever the previous cells left alive
+BENCH_PROTOCOL = 3
 
 # phase 2
 UNIFORM_RANKS = [4, 8, 16, 32]
@@ -288,6 +291,29 @@ def reset_memory(device: t.device):
     if mod is not None:
         mod.reset_peak_memory_stats()
         mod.empty_cache()
+
+
+def release_cell(device: t.device):
+    """
+    Drop everything the previous cell left alive, before the next one measures.
+
+    reset_peak_memory_stats sets the peak to whatever is *currently* allocated,
+    so a cell inherits every tensor still reachable when it starts. That is not
+    hypothetical: phase 1 runs kind-major (all 15 dense cells before the first
+    tensorized one), dynamo's caches keep each compiled module alive, and the
+    reduce-overhead cells keep a CUDA-Graph private pool, so every tensorized
+    peak was reported ~190 MB above the truth -- a batch-independent offset,
+    which is what made it read as a constant factor rather than as garbage.
+    Measured at n_embd=256, batch 1: tensorized fell 229 -> 39 MB against
+    dense's 113.
+
+    _dynamo.reset() is the one that matters and the one bench_cell never called
+    on the eager path; gc.collect() catches the reference cycles an autograd
+    graph leaves behind, which refcounting alone does not.
+    """
+    t._dynamo.reset()
+    gc.collect()
+    reset_memory(device)
 
 
 def peak_memory(device: t.device) -> int:
@@ -503,6 +529,11 @@ def bench_cell(kind: str, mode: Optional[str], batch: int, cfg: TrainConfig,
     """
     One (configuration, batch size) cell of the CoMERA figure
     """
+    # before anything is allocated: this cell must not inherit the previous
+    # one's compiled modules or CUDA-Graph pool, which reset_peak_memory_stats
+    # would fold into its baseline
+    release_cell(device)
+
     arm = Arm(kind, tensorized=(kind == "tensorized"), max_rank=max_rank)
     model = build_model(arm, cfg, ds, device)
     raw_model = model
@@ -549,6 +580,13 @@ def bench_cell(kind: str, mode: Optional[str], batch: int, cfg: TrainConfig,
     # half of what it saves on the parameter side -- the comparison it loses
     # is not the one training actually pays. Same three-way split as phase 2,
     # so the two phases measure the same optimizer.
+    # the timing loop's last graph is still reachable through loss; a cycle,
+    # so refcounting alone does not collect it. _dynamo.reset() is deliberately
+    # not called here -- model may be the compiled wrapper this cell measures
+    del loss
+    gc.collect()
+    reset_memory(device)
+
     opt = comera.make_optimizer(raw_model)
     # Adam allocates exp_avg/exp_avg_sq lazily on the first step; that
     # allocation belongs to the steady state, not to the measured peak
@@ -828,6 +866,8 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
     """
     Train one arm and collect every measurement the plots need
     """
+    release_cell(device)   # this arm's peak is its own, not the last arm's
+
     model = build_model(arm, cfg, ds, device)
     raw_model = model
 
