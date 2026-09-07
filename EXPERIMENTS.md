@@ -126,15 +126,28 @@ the writer flushes every 30 s -- the point is watching a run while it happens.
 Start it *before* the training cell and it refreshes on its own while `!python run_experiments.py
 --track tensorboard` runs.
 
-**A remote box (A100).** Point TensorBoard at the same directory on the server and forward the port:
+**A remote box (A100).** Two machines, so mind which shell each command belongs in.
+
+On the **server**, in the SSH session where the training is running (a second session, or a `tmux`
+window, since it keeps running):
+
+```bash
+tensorboard --logdir results/tb --port 6006
+```
+
+On your **own machine**, in a second terminal, forward the port and leave it running:
 
 ```bash
 ssh -N -L 6006:localhost:6006 user@host
 ```
 
-```bash
-tensorboard --logdir results/tb --port 6006 --bind_all
-```
+`user@host` is the login the provider gave you -- `ubuntu@203.0.113.42`, `root@ssh5.vast.ai -p 41022`
+(rented boxes usually listen on a non-standard port, hence the `-p`). Then open
+<http://localhost:6006> locally. No `--bind_all`: the tunnel reaches the server's own localhost, and
+binding TensorBoard to every interface would publish the dashboard to the internet instead.
+
+Some providers (RunPod, vast.ai) can expose a port through their web console, which replaces the
+tunnel entirely -- then TensorBoard does need `--bind_all` to be reachable from outside.
 
 | flag | default | what it does |
 |---|---|---|
