@@ -58,7 +58,30 @@ memory numbers were measured under an older protocol instead of mixing them with
 | `--gamma G` | `0.1` (`comera.GAMMA`) | weight of the rank loss in `comera_loss`. Held fixed across arms so `lr_rank` is the only pruning-aggressiveness axis. |
 | `--arms NAME ...` | all | subset of arm names, e.g. `--arms dense uniform-r16 adaptive-r16-lr0.01`. |
 | `--train-compile-mode eager\|compile\|cudagraph` | `compile` (smoke `eager`) | how the tensorized arms are compiled. **dense always trains eager.** `cudagraph` is not the default: CUDA Graphs replay a captured graph whose parameters AdamW mutates outside it, which inductor skips silently — phase 1 is where the graph win is measured. |
-| `--iters N` | `1500` (smoke `50`) | training iterations per arm. |
+| `--iters N` | `1500` (smoke `50`) | training iterations per arm — i.e. optimizer steps, each of which now consumes `--grad-accum` micro-batches. |
+| `--micro-batch N` | `32` (smoke `8`) | sequences per forward. This is what activation memory scales with. |
+| `--grad-accum N` | `1` | forward/backward passes accumulated before each optimizer step. |
+
+The batch the optimizer actually steps on is `--micro-batch x --grad-accum`, so a batch that does not
+fit in memory is reached by raising the accumulation rather than the micro-batch: `--micro-batch 16
+--grad-accum 8` trains on 128 sequences while only ever holding 16 sequences' worth of activations.
+The header line prints the arithmetic (`batch: 16 micro x 8 accum = 128`).
+
+Two details of the implementation worth knowing:
+
+- The per-micro-batch loss is divided by `--grad-accum`, so the accumulated gradient is the mean the
+  full batch would have produced, not its sum.
+- CoMERA's rank loss is a property of the weights, not of the data, so it is added on the **last**
+  micro-step only. That keeps it undivided and pays for `comera.rank_loss` once per optimizer step
+  instead of once per forward — it costs ~21 ms against a ~110 ms step, which is not something to
+  multiply by the accumulation factor.
+
+`step_time_s` therefore measures a whole optimizer step, accumulation included; at fixed effective
+batch, halving the micro-batch roughly doubles it. Measured under `--smoke`: `8 x 1` and `4 x 2` end
+at val 3.90 and 3.88 (same batch, different sampling), with peak memory 7.5 MB against 4.9 MB.
+
+`--grad-accum 1` is bit-identical to the pre-accumulation loop and is left out of the cache key, so
+existing cached arms stay valid; any other value is part of the key.
 | `--log-interval N` | `500` (smoke `25`) | iterations between printed progress lines. Losses are still recorded every 100 iterations for the plots. |
 
 ### Phase 5 — core diagnostics

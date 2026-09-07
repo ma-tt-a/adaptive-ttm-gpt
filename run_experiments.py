@@ -152,7 +152,11 @@ def build_arms(uniform_ranks: List[int], adaptive_ranks: List[int],
 @dataclass
 class TrainConfig:
     max_iters: int = 1500
+    # batch_size is the *micro*-batch: what one forward sees, and what the
+    # activation memory scales with. The batch the optimizer actually steps on
+    # is batch_size * grad_accum
     batch_size: int = 32
+    grad_accum: int = 1
     block_size: int = 128
     eval_interval: int = 100   # how often losses/ranks are recorded for plots
     log_interval: int = 500    # how often a progress line is printed
@@ -174,6 +178,14 @@ class TrainConfig:
     # into the cache key -- a cell measured in fp32 must not be read back as a
     # tf32 result. No effect on xpu/cpu, which have no TF32 path.
     matmul_precision: str = "tf32"   # tf32 | fp32
+
+    @property
+    def effective_batch(self) -> int:
+        return self.batch_size * self.grad_accum
+
+    @property
+    def tokens_per_step(self) -> int:
+        return self.effective_batch * self.block_size
 
     def smoke(self) -> "TrainConfig":
         return TrainConfig(
@@ -328,6 +340,12 @@ HASH_IGNORED = ("core_diag_interval",)
 
 def config_hash(arm: Arm, cfg: TrainConfig) -> str:
     cfg_d = {k: v for k, v in asdict(cfg).items() if k not in HASH_IGNORED}
+    # at grad_accum 1 the loop is the pre-accumulation one, step for step, so
+    # the field is dropped from the fingerprint and the existing cache stays
+    # valid. Any other value changes the optimizer's batch and must not
+    # collide with it
+    if cfg_d.get("grad_accum") == 1:
+        cfg_d.pop("grad_accum")
     return hash_payload(asdict(arm), cfg_d)
 
 
@@ -789,7 +807,9 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
                                "compile_mode": MODE_TAG[mode],
                                "device": str(device),
                                "nominal_params": nominal_params,
-                               "param_mb": param_bytes / 1e6})
+                               "param_mb": param_bytes / 1e6,
+                               "effective_batch": cfg.effective_batch,
+                               "tokens_per_step": cfg.tokens_per_step})
 
     history = {"iter": [], "train": [], "val": [], "eff_params": [],
                "eff_size": [], "rank_loss": []}
@@ -809,14 +829,23 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
         for g, base in zip(opt.param_groups, base_lrs):
             g["lr"] = base * mult
 
-        X, Y = ds.get_batch("train", cfg.batch_size, cfg.block_size, device,
-                            generator=gen)
         timer = StepTimer(device)
         with timer:
-            _, model_loss = model(X, Y)
-            loss = comera.comera_loss(model_loss, raw_model, arm.gamma)
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            for micro in range(cfg.grad_accum):
+                X, Y = ds.get_batch("train", cfg.batch_size, cfg.block_size,
+                                    device, generator=gen)
+                _, model_loss = model(X, Y)
+                # mean over the micro-batches, so the gradient is the one the
+                # full batch would have produced
+                loss = model_loss / cfg.grad_accum
+                # the rank loss is a property of the weights, not of the data:
+                # adding it on the last micro-step only keeps it undivided and
+                # pays for comera.rank_loss once per optimizer step instead of
+                # once per forward
+                if micro == cfg.grad_accum - 1:
+                    loss = comera.comera_loss(loss, raw_model, arm.gamma)
+                loss.backward()
             if cfg.grad_clip > 0:
                 t.nn.utils.clip_grad_norm_(
                     raw_model.parameters(), cfg.grad_clip)
@@ -904,6 +933,9 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
         "max_rank": arm.max_rank if arm.tensorized else None,
         "gamma": arm.gamma,
         "lr_rank": arm.lr_rank if arm.adaptive else None,
+        "micro_batch": cfg.batch_size,
+        "grad_accum": cfg.grad_accum,
+        "effective_batch": cfg.effective_batch,
         "nominal_params": nominal_params,
         "param_bytes": param_bytes,
         "param_mb": param_bytes / 1e6,
@@ -1738,6 +1770,15 @@ def main():
     ap.add_argument("--gamma", type=float, default=comera.GAMMA,
                     help="rank-loss weight for the adaptive arms")
     ap.add_argument("--iters", type=int, default=None)
+    ap.add_argument("--micro-batch", type=int, default=None,
+                    help="sequences per forward (default 32, smoke 8). This "
+                         "is what activation memory scales with")
+    ap.add_argument("--grad-accum", type=int, default=None,
+                    help="forward/backward passes accumulated before each "
+                         "optimizer step (default 1). The batch the optimizer "
+                         "steps on is --micro-batch x --grad-accum, so a "
+                         "batch too large to fit is reached by raising this "
+                         "rather than the micro-batch")
     ap.add_argument("--log-interval", type=int, default=None,
                     help="iterations between progress lines (default 500)")
     ap.add_argument("--core-diag-interval", type=int, default=None,
@@ -1801,6 +1842,11 @@ def main():
         cfg.max_iters = args.iters
     if args.log_interval is not None:
         cfg.log_interval = args.log_interval
+    if args.micro_batch is not None:
+        cfg.batch_size = args.micro_batch
+    if args.grad_accum is not None:
+        assert args.grad_accum >= 1, "--grad-accum must be at least 1"
+        cfg.grad_accum = args.grad_accum
     if args.core_diag_interval is not None:
         cfg.core_diag_interval = args.core_diag_interval
     CORE_DIAG_PLOT_ROLE = args.core_diag_role
@@ -1843,6 +1889,8 @@ def main():
     elif track.backend == "wandb":
         print(f"wandb: project={track.project} group={track.group} "
               f"mode={track.mode}")
+    print(f"batch: {cfg.batch_size} micro x {cfg.grad_accum} accum = "
+          f"{cfg.effective_batch} ({cfg.tokens_per_step:,d} tokens/step)")
     print(f"device={device}  matmul={cfg.matmul_precision}"
           f"{'' if device.type == 'cuda' else ' (no TF32 path here)'}  "
           f"init_std={cfg.init_std}  "
