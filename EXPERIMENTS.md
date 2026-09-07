@@ -21,6 +21,69 @@ Locally the interpreter is `.venv/Scripts/python.exe`; in Colab it is plain `pyt
 | `--progress` | off | per-iteration tqdm bars. Off by default because colab `!python` is not a tty and tqdm then writes one line per update, burying the results. |
 | `--init scaled\|normal` | `scaled` | `scaled`: cores sized so the *contracted* matrix has std 0.02. `normal`: literal std=1.0, which diverges — there to demonstrate why the scaling exists. |
 
+### Model and data
+
+| flag | default | what it does |
+|---|---|---|
+| `--dataset shakespeare\|fineweb-edu` | `shakespeare` | which corpus. `shakespeare` is char level (65 tokens, 1.0M train tokens, held in memory). `fineweb-edu` is [HuggingFaceFW/fineweb-edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) `sample-10BT` tokenized with the gpt2 BPE (50257 tokens) into `data/fineweb_edu_<subset>_<size>/{train,val}.bin` and read back as a memmap. |
+| `--data-tokens N` | `100_000_000` | fineweb-edu only: how many gpt2 **training** tokens the corpus must hold. Only the parquet row groups actually needed are downloaded, so this is the knob that decides the wait and the disk cost (2 bytes/token: 1e9 = 2 GB, 1e10 = 20 GB). Preparation is resumable and extensible — see below. |
+| `--data-subset` | `sample-10BT` | fineweb-edu only: which slice of the repo the tokens come from. `sample-10BT` caps at 10B tokens, then `sample-100BT`, `sample-350BT`, `full` (~1.3T). Each subset is tokenized into its own directory, and a larger subset costs nothing until its tokens are actually requested. |
+| `--model smoke\|base\|gpt2-small` | `base` | named model size — `n_layer` / `n_head` / `n_embd` / `block_size` together. `gpt2-small` is the published 124M configuration: 12 layers, 12 heads, 768 wide, 1024 context. The individual flags below still override it. |
+| `--block-size N` | `128` (`gpt2-small` 1024) | maximum sequence length, i.e. the context trained on. Also the `T` in every tokens-per-step number. |
+| `--lr LR` | `5e-5` (`comera.LR_ORIGIN`) | learning rate of everything that is not a TT core: embeddings, norms, biases, and every dense layer of the dense baseline. |
+| `--lr-tensor LR` | `1e-4` (`comera.LR_TENSOR`) | learning rate of the TT cores. CoMERA trains the cores faster than the rest; the rank parameters get their own rate from `--lr-ranks`. |
+| `--warmup N` | `100` (smoke `5`) | linear warmup iterations before the cosine decay to `min_lr_frac` of the peak. |
+| `--train-tokens N` | — | train for this many tokens instead of a fixed iteration count: `max_iters = ceil(N / (micro x accum x block))`. The inverse of `--iters`, and mutually exclusive with it. `max_iters` is what ends up in the cache key either way, so a token budget and the equivalent `--iters` address the same cached run. |
+
+Preparing the corpus is a separate step if you would rather not fold the download into the first
+training run — it writes the same directory the harness reads (`data/fineweb_edu_<subset>/`), so a
+later `--dataset fineweb-edu --data-tokens 500000000` finds it already there:
+
+```bash
+python data.py --dataset fineweb-edu --tokens 500000000
+python data.py --dataset fineweb-edu --tokens 20000000000 --subset sample-100BT
+```
+
+**Scaling past 1e8.** The corpus is written as 100M-token shards plus a `meta.json` recording the
+shards that are complete and the `(parquet file, row group)` to read next, rewritten after every
+shard. Two consequences:
+
+- **Resumable.** An interrupted preparation continues where it stopped instead of starting over: the
+  partial shard is dropped, and reading restarts from the checkpointed row group — one HTTP range
+  request, no re-download of what is already tokenized. This is why the reader is `pyarrow` over
+  `HfFileSystem` rather than `datasets`' streaming iterator, which can only resume by re-reading
+  from the beginning.
+- **Extensible.** `--data-tokens` is a floor, not a name: asking for 10B in a directory that already
+  holds 1B appends shards to it. So the way to scale a study up is to re-run with a bigger number,
+  and a run asking for *fewer* tokens than are on disk just reads a prefix. The validation split is
+  written once, before any training shard, and never grows — val losses stay comparable across
+  budgets.
+
+Measured locally: ~2.7M tokens/s of tokenization (tiktoken, one process), so 1e9 is ~6 min of CPU and
+1e10 ~1 h, both of which the download will dominate on colab. A row group is ~1M tokens, and that is
+also the most an interruption can cost you beyond the partial shard.
+
+gpt2-small on FineWeb-Edu, one arm, batch 8x16 = 128 sequences of 1024 tokens:
+
+```bash
+python run_experiments.py --phases train --dataset fineweb-edu --data-tokens 2000000000     --model gpt2-small --micro-batch 8 --grad-accum 16 --train-tokens 2000000000 --warmup 700     --lr 6e-4 --lr-tensor 6e-4 --arms dense
+```
+
+`--train-tokens` is the same number as `--data-tokens` here, which is the single-epoch case: how many
+iterations that is depends on the batch and the context, and is exactly the arithmetic the budget
+line below prints back.
+
+Before the first arm starts, phase 2 prints the token budget — the number that decides whether the
+run is worth launching, and the one thing the loss curve cannot tell you afterwards:
+
+```
+budget: 131,072 tokens/step (8 micro x 16 accum x 1024 ctx) x 15,000 iters = 1.97B tokens per arm
+        fineweb-edu train split 1.99B tokens -> 0.99 epochs; warmup 700 iters (91.75M tokens, 4.7% of the run)
+```
+
+More than ~1.5 passes over a tokenized corpus prints a warning: on a corpus this size repetition is a
+choice, and `--data-tokens` is cheaper than an extra epoch.
+
 ### Phase 1 — benchmark
 
 | flag | default | what it does |

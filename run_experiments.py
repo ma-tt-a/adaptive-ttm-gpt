@@ -34,12 +34,14 @@ measured once, across batch sizes; quality is measured once, compiled only.
 """
 import argparse
 import csv
+import gc
 import glob
 import hashlib
 import json
 import math
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
@@ -49,9 +51,10 @@ import torch._dynamo
 from tqdm.auto import tqdm
 
 import comera
+import data
 import tracking
-from data import CharDataset
-from gpt import GPT, GPTConfig, TT_SHAPES
+from data import DATASETS, get_dataset, human_tokens
+from gpt import GPT, GPTConfig, MODEL_PRESETS, TT_SHAPES
 from tensorized_layers import TTLinear
 from utils import get_device, device_module, get_uniform_rank
 
@@ -76,6 +79,17 @@ TABLES_DIR = os.path.join(RESULTS, "tables")
 PLOTS_DIR = os.path.join(RESULTS, "plots")
 
 
+def printable(text: str) -> str:
+    """
+    Drop what stdout cannot encode.
+
+    A gpt2 sample is arbitrary unicode and a Windows console is cp1252, which
+    raises on it -- at the very last print of a multi-hour run.
+    """
+    enc = sys.stdout.encoding or "utf-8"
+    return text.encode(enc, errors="replace").decode(enc, errors="replace")
+
+
 def label_of(kind: str, mode: Optional[str]) -> str:
     return f"{kind}, {MODE_LABEL[mode]}"
 
@@ -96,8 +110,10 @@ BENCH_WARMUP = 5     # steps paid before timing, so the JIT and the CUDA-Graph
 BENCH_REPS = 30      # capture are out of the way
 # bumped whenever a bench cell measures something different under the same
 # flags, so stale cells recompute instead of being silently mixed in with new
-# ones. 2: the memory pass runs a full AdamW step, states included
-BENCH_PROTOCOL = 2
+# ones. 2: the memory pass runs a full AdamW step, states included.
+# 3: cells are isolated from each other (release_cell), which every recorded
+# peak before it was measured on top of whatever the previous cells left alive
+BENCH_PROTOCOL = 3
 
 # phase 2
 UNIFORM_RANKS = [4, 8, 16, 32]
@@ -178,6 +194,15 @@ class TrainConfig:
     # into the cache key -- a cell measured in fp32 must not be read back as a
     # tf32 result. No effect on xpu/cpu, which have no TF32 path.
     matmul_precision: str = "tf32"   # tf32 | fp32
+    # which corpus, and -- for the streamed ones -- how much of it is
+    # tokenized to disk. tiny-shakespeare ignores data_tokens
+    dataset: str = "shakespeare"
+    data_tokens: int = data.FINEWEB_TOKENS
+    data_subset: str = data.FINEWEB_SUBSET
+    # the two learning rates comera.param_groups splits the model into; the
+    # third (rank params) is per-arm, since it is the pruning axis
+    lr: float = comera.LR_ORIGIN      # everything that is not a TT core
+    lr_tensor: float = comera.LR_TENSOR   # the TT cores
 
     @property
     def effective_batch(self) -> int:
@@ -196,6 +221,9 @@ class TrainConfig:
             core_diag_interval=10,
             init_std=self.init_std, seed=self.seed,
             matmul_precision=self.matmul_precision,
+            dataset=self.dataset, data_tokens=self.data_tokens,
+            data_subset=self.data_subset,
+            lr=self.lr, lr_tensor=self.lr_tensor,
         )
 
 
@@ -263,6 +291,29 @@ def reset_memory(device: t.device):
     if mod is not None:
         mod.reset_peak_memory_stats()
         mod.empty_cache()
+
+
+def release_cell(device: t.device):
+    """
+    Drop everything the previous cell left alive, before the next one measures.
+
+    reset_peak_memory_stats sets the peak to whatever is *currently* allocated,
+    so a cell inherits every tensor still reachable when it starts. That is not
+    hypothetical: phase 1 runs kind-major (all 15 dense cells before the first
+    tensorized one), dynamo's caches keep each compiled module alive, and the
+    reduce-overhead cells keep a CUDA-Graph private pool, so every tensorized
+    peak was reported ~190 MB above the truth -- a batch-independent offset,
+    which is what made it read as a constant factor rather than as garbage.
+    Measured at n_embd=256, batch 1: tensorized fell 229 -> 39 MB against
+    dense's 113.
+
+    _dynamo.reset() is the one that matters and the one bench_cell never called
+    on the eager path; gc.collect() catches the reference cycles an autograd
+    graph leaves behind, which refcounting alone does not.
+    """
+    t._dynamo.reset()
+    gc.collect()
+    reset_memory(device)
 
 
 def peak_memory(device: t.device) -> int:
@@ -337,9 +388,25 @@ def hash_payload(*parts) -> str:
 # whatever diagnostics it was computed with (--force to resample).
 HASH_IGNORED = ("core_diag_interval",)
 
+# defaults of fields added after the cache already existed. A run that leaves
+# one alone measures exactly what the old code measured, so the field is
+# dropped from the fingerprint and every cached record stays readable; any
+# other value is a different experiment and gets its own key.
+HASH_LEGACY = {"dataset": "shakespeare",
+               "data_tokens": data.FINEWEB_TOKENS,
+               "data_subset": data.FINEWEB_SUBSET,
+               "lr": comera.LR_ORIGIN,
+               "lr_tensor": comera.LR_TENSOR}
+
+
+def cfg_fingerprint(cfg: TrainConfig) -> dict:
+    return {k: v for k, v in asdict(cfg).items()
+            if k not in HASH_LEGACY or HASH_LEGACY[k] != v}
+
 
 def config_hash(arm: Arm, cfg: TrainConfig) -> str:
-    cfg_d = {k: v for k, v in asdict(cfg).items() if k not in HASH_IGNORED}
+    cfg_d = {k: v for k, v in cfg_fingerprint(cfg).items()
+             if k not in HASH_IGNORED}
     # at grad_accum 1 the loop is the pre-accumulation one, step for step, so
     # the field is dropped from the fingerprint and the existing cache stays
     # valid. Any other value changes the optimizer's batch and must not
@@ -387,7 +454,7 @@ def cached_or_compute(path: str, want: str, compute, force: bool, tag: str,
 # model / training primitives
 # ============================================================================
 
-def build_model(arm: Arm, cfg: TrainConfig, ds: CharDataset,
+def build_model(arm: Arm, cfg: TrainConfig, ds: data.Dataset,
                 device: t.device) -> GPT:
     t.manual_seed(cfg.seed)
     gpt_cfg = GPTConfig(
@@ -435,7 +502,7 @@ def lr_multiplier(it: int, cfg: TrainConfig) -> float:
 
 
 @t.no_grad()
-def estimate_loss(model, ds: CharDataset, cfg: TrainConfig,
+def estimate_loss(model, ds: data.Dataset, cfg: TrainConfig,
                   device: t.device) -> Dict[str, float]:
     model.eval()
     out = {}
@@ -457,11 +524,16 @@ def estimate_loss(model, ds: CharDataset, cfg: TrainConfig,
 # ============================================================================
 
 def bench_cell(kind: str, mode: Optional[str], batch: int, cfg: TrainConfig,
-               ds: CharDataset, device: t.device, max_rank: int,
+               ds: data.Dataset, device: t.device, max_rank: int,
                reps: int, warmup: int) -> dict:
     """
     One (configuration, batch size) cell of the CoMERA figure
     """
+    # before anything is allocated: this cell must not inherit the previous
+    # one's compiled modules or CUDA-Graph pool, which reset_peak_memory_stats
+    # would fold into its baseline
+    release_cell(device)
+
     arm = Arm(kind, tensorized=(kind == "tensorized"), max_rank=max_rank)
     model = build_model(arm, cfg, ds, device)
     raw_model = model
@@ -508,6 +580,13 @@ def bench_cell(kind: str, mode: Optional[str], batch: int, cfg: TrainConfig,
     # half of what it saves on the parameter side -- the comparison it loses
     # is not the one training actually pays. Same three-way split as phase 2,
     # so the two phases measure the same optimizer.
+    # the timing loop's last graph is still reachable through loss; a cycle,
+    # so refcounting alone does not collect it. _dynamo.reset() is deliberately
+    # not called here -- model may be the compiled wrapper this cell measures
+    del loss
+    gc.collect()
+    reset_memory(device)
+
     opt = comera.make_optimizer(raw_model)
     # Adam allocates exp_avg/exp_avg_sq lazily on the first step; that
     # allocation belongs to the steady state, not to the measured peak
@@ -542,7 +621,7 @@ def bench_cell(kind: str, mode: Optional[str], batch: int, cfg: TrainConfig,
         "block_size": cfg.block_size,
         "max_rank": max_rank if kind == "tensorized" else None,
         "config_hash": hash_payload(kind, MODE_TAG[mode], batch, max_rank,
-                                    asdict(cfg), reps, warmup,
+                                    cfg_fingerprint(cfg), reps, warmup,
                                     BENCH_PROTOCOL),
         "fwd_s": fwd_s,
         "bwd_s": bwd_s,
@@ -578,7 +657,7 @@ def bench_cell(kind: str, mode: Optional[str], batch: int, cfg: TrainConfig,
     }
 
 
-def run_bench(cfg: TrainConfig, ds: CharDataset, device: t.device,
+def run_bench(cfg: TrainConfig, ds: data.Dataset, device: t.device,
               batches: List[int], modes: List[Optional[str]], max_rank: int,
               reps: int, warmup: int, force: bool,
               allowed: bool) -> List[dict]:
@@ -595,7 +674,8 @@ def run_bench(cfg: TrainConfig, ds: CharDataset, device: t.device,
     for kind, mode, batch in tqdm(cells, desc="bench", disable=BAR_DISABLE):
         tag = f"{kind}_{MODE_TAG[mode]}_b{batch}"
         want = hash_payload(kind, MODE_TAG[mode], batch, max_rank,
-                            asdict(cfg), reps, warmup, BENCH_PROTOCOL)
+                            cfg_fingerprint(cfg), reps, warmup,
+                            BENCH_PROTOCOL)
         path = os.path.join(RUNS_DIR, f"bench_{tag}_{want}.json")
         rec = cached_or_compute(
             path, want,
@@ -782,10 +862,12 @@ def core_rows(rec: dict, key: str = "core_diag") -> List[dict]:
 
 
 def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
-              ds: CharDataset, device: t.device) -> dict:
+              ds: data.Dataset, device: t.device) -> dict:
     """
     Train one arm and collect every measurement the plots need
     """
+    release_cell(device)   # this arm's peak is its own, not the last arm's
+
     model = build_model(arm, cfg, ds, device)
     raw_model = model
 
@@ -795,7 +877,9 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
 
     model, compile_time = compile_model(model, mode)
 
-    opt = comera.make_optimizer(raw_model, lr_rank=arm.lr_rank)
+    opt = comera.make_optimizer(raw_model, lr_origin=cfg.lr,
+                                lr_tensor=cfg.lr_tensor,
+                                lr_rank=arm.lr_rank)
     base_lrs = [g["lr"] for g in opt.param_groups]
 
     gen = t.Generator().manual_seed(cfg.seed)  # identical batch stream per arm
@@ -905,8 +989,14 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
 
     try:
         ctx = t.zeros((1, 1), dtype=t.long, device=device)
+        # top_k is dropped on xpu with a real tokenizer: torch.topk over a row
+        # wider than ~2k *aborts the process* on this driver rather than
+        # raising, so the except below cannot contain it and one sample would
+        # take the whole run down at the last line of an arm. cuda is fine
+        top_k = None if (device.type == "xpu" and ds.vocab_size > 2048) else 40
         sample = ds.decode(raw_model.generate(ctx, cfg.sample_tokens,
-                                              temperature=0.8, top_k=40)[0])
+                                              temperature=0.8,
+                                              top_k=top_k)[0])
     except Exception as e:
         sample = f"<generation failed: {e}>"
 
@@ -969,7 +1059,45 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
     }
 
 
-def run_train(arms: List[Arm], cfg: TrainConfig, ds: CharDataset,
+def token_budget(cfg: TrainConfig, ds: data.Dataset,
+                 n_arms: int = 1) -> dict:
+    """
+    How much data one arm actually sees, in tokens and in passes over the corpus
+    """
+    train_tokens = len(ds.splits["train"])
+    per_arm = cfg.tokens_per_step * cfg.max_iters
+    return {"tokens_per_step": cfg.tokens_per_step,
+            "tokens_per_arm": per_arm,
+            "tokens_total": per_arm * n_arms,
+            "train_tokens": train_tokens,
+            "epochs": per_arm / max(1, train_tokens),
+            "warmup_tokens": cfg.tokens_per_step * cfg.warmup_iters}
+
+
+def print_budget(cfg: TrainConfig, ds: data.Dataset, n_arms: int) -> None:
+    """
+    The line to read before committing a GPU-day: tokens, epochs over the
+    corpus, and how much of the run is warmup. Printed before the first arm
+    starts, since none of it is recoverable from the loss curve afterwards
+    """
+    b = token_budget(cfg, ds, n_arms)
+    print(f"budget: {b['tokens_per_step']:,d} tokens/step "
+          f"({cfg.batch_size} micro x {cfg.grad_accum} accum x "
+          f"{cfg.block_size} ctx) x {cfg.max_iters:,d} iters = "
+          f"{human_tokens(b['tokens_per_arm'])} tokens per arm")
+    print(f"        {ds.name} train split {human_tokens(b['train_tokens'])} "
+          f"tokens -> {b['epochs']:.2f} epochs; warmup {cfg.warmup_iters} "
+          f"iters ({human_tokens(b['warmup_tokens'])} tokens, "
+          f"{cfg.warmup_iters / max(1, cfg.max_iters):.1%} of the run)")
+    if n_arms > 1:
+        print(f"        {n_arms} arms -> "
+              f"{human_tokens(b['tokens_total'])} tokens in total")
+    if b["epochs"] > 1.5 and ds.name != "shakespeare":
+        print(f"        ! {b['epochs']:.1f} passes over the corpus -- raise "
+              f"--data-tokens to keep the run single-epoch")
+
+
+def run_train(arms: List[Arm], cfg: TrainConfig, ds: data.Dataset,
               device: t.device, train_mode: Optional[str], force: bool,
               allowed: bool) -> List[dict]:
     records = []
@@ -1769,6 +1897,46 @@ def main():
                     help="rank learning rates, one adaptive family each")
     ap.add_argument("--gamma", type=float, default=comera.GAMMA,
                     help="rank-loss weight for the adaptive arms")
+    ap.add_argument("--dataset", default=None, choices=list(DATASETS),
+                    help="corpus to train on: shakespeare (char level, 65 "
+                         "tokens) or fineweb-edu (gpt2 tokens, streamed and "
+                         "tokenized into data/ on first use)")
+    ap.add_argument("--data-tokens", type=int, default=None,
+                    help="fineweb-edu: gpt2 tokens tokenized to disk "
+                         f"(default {data.FINEWEB_TOKENS:,d}). Only that much "
+                         "of the stream is ever downloaded")
+    ap.add_argument("--data-subset", default=None,
+                    choices=list(data.FINEWEB_SUBSETS),
+                    help="fineweb-edu: which slice of the repo the tokens are "
+                         "drawn from -- sample-10BT (the default) caps at 10B "
+                         "tokens, then sample-100BT / sample-350BT / full. "
+                         "Each subset is tokenized into its own directory, and "
+                         "only the row groups actually needed are downloaded, "
+                         "so a larger subset costs nothing until it is used")
+    ap.add_argument("--train-tokens", type=int, default=None,
+                    help="train for this many tokens instead of a fixed "
+                         "iteration count: max_iters = ceil(N / tokens per "
+                         "step). The inverse of --iters, which it replaces; "
+                         "the two cannot both be given")
+    ap.add_argument("--model", default=None, choices=list(MODEL_PRESETS),
+                    help="named model size -- n_layer / n_head / n_embd / "
+                         "block_size. gpt2-small is the published 124M "
+                         "configuration (12 layers, 12 heads, 768 wide, 1024 "
+                         "context); the individual flags still override it")
+    ap.add_argument("--block-size", type=int, default=None,
+                    help="maximum sequence length, i.e. the context trained "
+                         "on (default 128; 1024 under --model gpt2-small)")
+    ap.add_argument("--lr", type=float, default=None,
+                    help="learning rate of everything that is not a TT core: "
+                         "embeddings, norms, biases, dense layers "
+                         f"(default {comera.LR_ORIGIN:g})")
+    ap.add_argument("--lr-tensor", type=float, default=None,
+                    help=f"learning rate of the TT cores (default "
+                         f"{comera.LR_TENSOR:g}). The rank parameters have "
+                         "their own, --lr-ranks")
+    ap.add_argument("--warmup", type=int, default=None,
+                    help="linear warmup iterations before the cosine decay "
+                         "(default 100, 5 under --smoke)")
     ap.add_argument("--iters", type=int, default=None)
     ap.add_argument("--micro-batch", type=int, default=None,
                     help="sequences per forward (default 32, smoke 8). This "
@@ -1838,6 +2006,23 @@ def main():
     if args.init == "normal":
         # what "just use standard normal" actually means; expect divergence
         cfg.init_std = 1.0
+    if args.model is not None:
+        for k, v in MODEL_PRESETS[args.model].items():
+            setattr(cfg, k, v)
+    if args.dataset is not None:
+        cfg.dataset = args.dataset
+    if args.data_tokens is not None:
+        cfg.data_tokens = args.data_tokens
+    if args.data_subset is not None:
+        cfg.data_subset = args.data_subset
+    if args.block_size is not None:
+        cfg.block_size = args.block_size
+    if args.lr is not None:
+        cfg.lr = args.lr
+    if args.lr_tensor is not None:
+        cfg.lr_tensor = args.lr_tensor
+    if args.warmup is not None:
+        cfg.warmup_iters = args.warmup
     if args.iters is not None:
         cfg.max_iters = args.iters
     if args.log_interval is not None:
@@ -1847,6 +2032,13 @@ def main():
     if args.grad_accum is not None:
         assert args.grad_accum >= 1, "--grad-accum must be at least 1"
         cfg.grad_accum = args.grad_accum
+    if args.train_tokens is not None:
+        assert args.iters is None,             "--iters and --train-tokens both set the iteration count"
+        # applied after the batch and block flags, since it is defined in terms
+        # of them. max_iters is what lands in the cache key either way, so a
+        # token budget and the equivalent --iters address the same cached run
+        cfg.max_iters = max(1, math.ceil(args.train_tokens
+                                         / cfg.tokens_per_step))
     if args.core_diag_interval is not None:
         cfg.core_diag_interval = args.core_diag_interval
     CORE_DIAG_PLOT_ROLE = args.core_diag_role
@@ -1874,7 +2066,7 @@ def main():
     device = get_device()
     set_matmul_precision(cfg.matmul_precision)
     t.manual_seed(cfg.seed)
-    ds = CharDataset()
+    ds = get_dataset(cfg.dataset, cfg.data_tokens, cfg.data_subset)
 
     modes = [MODE_FROM_TAG[m] for m in args.compile_modes]
     bench_rank = min(args.bench_rank, max(ranks)) if args.smoke \
@@ -1894,8 +2086,13 @@ def main():
     print(f"device={device}  matmul={cfg.matmul_precision}"
           f"{'' if device.type == 'cuda' else ' (no TF32 path here)'}  "
           f"init_std={cfg.init_std}  "
-          f"n_layer={cfg.n_layer} n_embd={cfg.n_embd} "
+          f"n_layer={cfg.n_layer} n_head={cfg.n_head} n_embd={cfg.n_embd} "
           f"block={cfg.block_size} iters={cfg.max_iters}")
+    corpus = ds.name + (f"/{cfg.data_subset}" if cfg.dataset != "shakespeare"
+                        else "")
+    print(f"data={corpus} vocab={ds.vocab_size}  "
+          f"lr={cfg.lr:g} (cores {cfg.lr_tensor:g})  "
+          f"warmup={cfg.warmup_iters}")
     print(f"phase 1: {len(BENCH_KINDS)*len(modes)} configs x {len(batches)} "
           f"batches (rank {bench_rank})")
     print(f"phase 2: {len(arms)} arms, tensorized compiled with "
@@ -1906,6 +2103,8 @@ def main():
                       warmup, args.force, "bench" in args.phases)
 
     print("\nphase 2 -- training")
+    if "train" in args.phases:
+        print_budget(cfg, ds, len(arms))
     train = run_train(arms, cfg, ds, device, MODE_FROM_TAG[train_mode],
                       args.force, "train" in args.phases)
 
@@ -2004,7 +2203,7 @@ def main():
 
     if train:
         best = min(train, key=lambda r: r["final_val_loss"])
-        print(f"sample from {best['arm']}:\n{'-'*40}\n{best['sample']}\n"
+        print(f"sample from {best['arm']}:\n{'-'*40}\n{printable(best['sample'])}\n"
               f"{'-'*40}")
 
 
