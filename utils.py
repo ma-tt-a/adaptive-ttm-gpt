@@ -116,29 +116,17 @@ def tt_svd(X: t.Tensor):
 class TTMatVec(t.autograd.Function):
 
     @staticmethod
-    def A_i(i: int, *cores: List[t.Tensor]):
-        return tt_2_tensor(cores[:i])
-
-    @staticmethod
-    def B_i(i: int, *cores: List[t.Tensor]):
-        d = len(cores) // 2
-        return tt_2_tensor(cores[d:d+i])
-
-    @staticmethod
-    def A_inv_i(i: int, *cores: List[t.Tensor]):
-        d = len(cores) // 2
-        return tt_2_tensor(cores[d-i:d])
-
-    @staticmethod
-    def B_inv_i(i: int, *cores: List[t.Tensor]):
-        d = len(cores) // 2
-        return tt_2_tensor(cores[2*d-i:])
-
-    @staticmethod
     def forward(ctx, X: t.Tensor, *cores: List[t.Tensor]):
         d = len(cores) // 2
-        A_d = TTMatVec.A_i(d, *cores)
-        B_d = TTMatVec.B_i(d, *cores)
+
+        A_d = cores[0]
+        for i in range(1, d):
+            A_d = t.tensordot(A_d, cores[i], dims=([-1], [0]))
+
+        B_d = cores[d]
+        for i in range(d+1, 2*d):
+            B_d = t.tensordot(B_d, cores[i], dims=([-1], [0]))
+
         a_sh = A_d.shape
         b_sh = B_d.shape
         T_1 = X @ A_d.reshape((a_sh[:-1].numel(), a_sh[-1]))
@@ -159,9 +147,28 @@ class TTMatVec(t.autograd.Function):
 
         # =============
 
+        A = [cores[0]]
+        d = len(cores) // 2
+        for i in range(1, d):
+            A.append(t.tensordot(A[-1], cores[i], dims=([-1], [0])))
+
+        A_inv = [cores[d-1]]
+        for i in range(d-2, -1, -1):
+            A_inv.append(t.tensordot(cores[i], A_inv[-1], dims=([-1], [0])))
+
+        B = [cores[d]]
+        for i in range(d+1, 2*d):
+            B.append(t.tensordot(B[-1], cores[i], dims=([-1], [0])))
+
+        B_inv = [cores[2*d-1]]
+        for i in range(2*d-2, d-1, -1):
+            B_inv.append(t.tensordot(cores[i], B_inv[-1], dims=([-1], [0])))
+
+        # =============
+
         # g_X
-        A_d = TTMatVec.A_i(d, *cores)
-        B_d = TTMatVec.B_i(d, *cores)
+        A_d = A[d-1]
+        B_d = B[d-1]
         a_sh = A_d.shape
         b_sh = B_d.shape
 
@@ -182,7 +189,7 @@ class TTMatVec(t.autograd.Function):
 
         g_G_1 = t.einsum(
             U_2, expr_U_2,
-            TTMatVec.A_inv_i(d-i, *cores), expr_A_inv_i,
+            A_inv[d-i-1], expr_A_inv_i,
             expr_g_G
         )[None, :, :]
         g_G_left.append(g_G_1)
@@ -196,8 +203,8 @@ class TTMatVec(t.autograd.Function):
 
             g_G_i = t.einsum(
                 U_2, expr_U_2,
-                TTMatVec.A_i(i-1, *cores), expr_A_i,
-                TTMatVec.A_inv_i(d-i, *cores), expr_A_inv_i,
+                A[i-2], expr_A_i,
+                A_inv[d-i-1], expr_A_inv_i,
                 expr_g_G
             )
             g_G_left.append(g_G_i)
@@ -210,7 +217,7 @@ class TTMatVec(t.autograd.Function):
 
         g_G_d = t.einsum(
             U_2, expr_U_2,
-            TTMatVec.A_i(i-1, *cores), expr_A_i,
+            A[i-2], expr_A_i,
             expr_g_G
         )
         g_G_left.append(g_G_d)
@@ -229,7 +236,7 @@ class TTMatVec(t.autograd.Function):
 
         g_G_d1 = t.einsum(
             T_2, expr_T_2,
-            TTMatVec.B_inv_i(2*d-i, *cores), expr_B_inv_i,
+            B_inv[2*d-i-1], expr_B_inv_i,
             expr_g_G
         )
         g_G_right.append(g_G_d1)
@@ -243,8 +250,8 @@ class TTMatVec(t.autograd.Function):
 
             g_G_di = t.einsum(
                 T_2, expr_T_2,
-                TTMatVec.B_i(i-1-d, *cores), expr_B_i,
-                TTMatVec.B_inv_i(2*d-i, *cores), expr_B_inv_i,
+                B[i-d-2], expr_B_i,
+                B_inv[2*d-i-1], expr_B_inv_i,
                 expr_g_G
             )
             g_G_right.append(g_G_di)
@@ -257,7 +264,7 @@ class TTMatVec(t.autograd.Function):
 
         g_G_2d = t.einsum(
             T_2, expr_T_2,
-            TTMatVec.B_i(i-1-d, *cores), expr_B_i,
+            B[i-d-2], expr_B_i,
             expr_g_G
         )[:, :, None]
         g_G_right.append(g_G_2d)
