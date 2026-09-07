@@ -168,6 +168,12 @@ class TrainConfig:
     init_std: float = 2e-2
     sample_tokens: int = 200
     core_diag_interval: int = 100  # iterations between core snapshots; 0 = off
+    # tf32 by default: on an Ampere-or-newer cuda device this is the tensor-core
+    # path for float32 matmuls, and it is what the target hardware would
+    # actually train in. It is part of the config, not a global flag, so it goes
+    # into the cache key -- a cell measured in fp32 must not be read back as a
+    # tf32 result. No effect on xpu/cpu, which have no TF32 path.
+    matmul_precision: str = "tf32"   # tf32 | fp32
 
     def smoke(self) -> "TrainConfig":
         return TrainConfig(
@@ -177,6 +183,7 @@ class TrainConfig:
             n_layer=2, n_head=4, n_embd=64, sample_tokens=64,
             core_diag_interval=10,
             init_std=self.init_std, seed=self.seed,
+            matmul_precision=self.matmul_precision,
         )
 
 
@@ -215,6 +222,20 @@ class StepTimer:
         else:
             self.times.append(time.perf_counter() - self.t0)
         return False
+
+
+def set_matmul_precision(name: str):
+    """
+    Whether float32 matmuls may run on the TF32 tensor cores.
+
+    Three switches for one decision: set_float32_matmul_precision covers what
+    goes through torch's own dispatch, and the two backend flags cover cuBLAS
+    and cuDNN, which read their own globals.
+    """
+    tf32 = (name == "tf32")
+    t.set_float32_matmul_precision("high" if tf32 else "highest")
+    t.backends.cuda.matmul.allow_tf32 = tf32
+    t.backends.cudnn.allow_tf32 = tf32
 
 
 def median(xs: List[float]) -> float:
@@ -1677,6 +1698,13 @@ def main():
                          "phases always run and only re-plot the cache")
     ap.add_argument("--force", action="store_true",
                     help="recompute cells that are already cached")
+    ap.add_argument("--matmul-precision", choices=["tf32", "fp32"],
+                    default=None,
+                    help="tf32 (the default) runs float32 matmuls on the "
+                         "tensor cores; fp32 keeps full float32 arithmetic. "
+                         "Part of the cache key, so switching recomputes "
+                         "instead of mixing the two. cuda-only; xpu and cpu "
+                         "have no TF32 path and ignore it")
     ap.add_argument("--init", choices=["scaled", "normal"], default="scaled",
                     help="scaled: cores sized so the contracted matrix has "
                          "std 0.02; normal: literal standard normal")
@@ -1764,6 +1792,8 @@ def main():
         batches = [8, 16]
         ranks = [4, 8]
         reps, warmup = 5, 2
+    if args.matmul_precision is not None:
+        cfg.matmul_precision = args.matmul_precision
     if args.init == "normal":
         # what "just use standard normal" actually means; expect divergence
         cfg.init_std = 1.0
@@ -1796,6 +1826,7 @@ def main():
         mode=args.wandb_mode)
 
     device = get_device()
+    set_matmul_precision(cfg.matmul_precision)
     t.manual_seed(cfg.seed)
     ds = CharDataset()
 
@@ -1812,7 +1843,9 @@ def main():
     elif track.backend == "wandb":
         print(f"wandb: project={track.project} group={track.group} "
               f"mode={track.mode}")
-    print(f"device={device}  init_std={cfg.init_std}  "
+    print(f"device={device}  matmul={cfg.matmul_precision}"
+          f"{'' if device.type == 'cuda' else ' (no TF32 path here)'}  "
+          f"init_std={cfg.init_std}  "
           f"n_layer={cfg.n_layer} n_embd={cfg.n_embd} "
           f"block={cfg.block_size} iters={cfg.max_iters}")
     print(f"phase 1: {len(BENCH_KINDS)*len(modes)} configs x {len(batches)} "
