@@ -116,7 +116,28 @@ def tt_svd(X: t.Tensor):
 class TTMatVec(t.autograd.Function):
 
 	@staticmethod
+	def cast_dtype(X: t.Tensor, cores: List[t.Tensor]):
+		"""
+		The single dtype the whole Function runs in
+		"""
+		dev = X.device.type
+		if t.is_autocast_enabled(dev):
+			return t.get_autocast_dtype(dev)
+		return t.promote_types(X.dtype, cores[0].dtype)
+
+	@staticmethod
 	def forward(ctx, X: t.Tensor, *cores: List[t.Tensor]):
+		# One dtype for the whole chain. Under autocast the contractions below
+		# are cast op by op, so X and T_1 would be saved in the autocast dtype
+		# while the cores stayed fp32, and backward would contract the two
+		# against each other. Casting the inputs up front and casting the
+		# gradients back in backward is what amp's custom_fwd / custom_bwd do;
+		# it is spelled out here because those decorators are bound to one
+		# device_type and this project runs on cuda, xpu and cpu.
+		dtype = TTMatVec.cast_dtype(X, cores)
+		ctx.in_dtypes = (X.dtype,) + tuple(G.dtype for G in cores)
+		X = X.to(dtype)
+		cores = tuple(G.to(dtype) for G in cores)
 		d = len(cores) // 2
 
 		A_d = cores[0]
@@ -271,5 +292,7 @@ class TTMatVec(t.autograd.Function):
 
 		# =============
 
-		# g = [g_X] + g_G_left + g_G_right
-		return g_X, *g_G_left, *g_G_right
+		# g = [g_X] + g_G_left + g_G_right, back in the dtypes forward was
+		# handed -- autograd accumulates into the fp32 parameters themselves
+		grads = (g_X, *g_G_left, *g_G_right)
+		return tuple(g.to(dtype) for g, dtype in zip(grads, ctx.in_dtypes))
