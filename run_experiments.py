@@ -112,8 +112,10 @@ BENCH_REPS = 30      # capture are out of the way
 # flags, so stale cells recompute instead of being silently mixed in with new
 # ones. 2: the memory pass runs a full AdamW step, states included.
 # 3: cells are isolated from each other (release_cell), which every recorded
-# peak before it was measured on top of whatever the previous cells left alive
-BENCH_PROTOCOL = 3
+# peak before it was measured on top of whatever the previous cells left alive.
+# 4: peaks are deltas over the baseline plus the exact resident sizes, since
+# release_cell does not in fact free the cudagraph cells' captured graphs
+BENCH_PROTOCOL = 4
 
 # phase 2
 UNIFORM_RANKS = [4, 8, 16, 32]
@@ -310,6 +312,16 @@ def release_cell(device: t.device):
     _dynamo.reset() is the one that matters and the one bench_cell never called
     on the eager path; gc.collect() catches the reference cycles an autograd
     graph leaves behind, which refcounting alone does not.
+
+    It is not sufficient on its own, and measured proof that it is not: after
+    it, a tensorized cell preceded by three cudagraph ones still reported a
+    136 MB intercept against dense's 78, where its parameters and states are
+    2.7 MB. Inductor's captured graphs and the cuBLAS workspaces of the
+    capture streams survive the reset. So the peaks are *also* measured as a
+    delta over the baseline this leaves behind (see measured_peak), which is
+    what makes the number independent of who else is holding memory; this
+    function only keeps that baseline small enough that a cell does not fail
+    to allocate.
     """
     t._dynamo.reset()
     gc.collect()
@@ -319,6 +331,14 @@ def release_cell(device: t.device):
 def peak_memory(device: t.device) -> int:
     mod = device_module(device)
     return int(mod.max_memory_allocated()) if mod is not None else 0
+
+
+def allocated_memory(device: t.device) -> int:
+    """
+    What is live right now -- the baseline a measured peak is charged against
+    """
+    mod = device_module(device)
+    return int(mod.memory_allocated()) if mod is not None else 0
 
 
 def graph_breaks() -> int:
@@ -595,20 +615,35 @@ def bench_cell(kind: str, mode: Optional[str], batch: int, cfg: TrainConfig,
     loss.backward()
     opt.step()
 
+    # measured against the baseline rather than absolutely. reset_peak_memory_
+    # stats starts the peak at whatever is live, which is this model plus its
+    # states plus whatever earlier cells still hold; subtracting `base` removes
+    # all three, and the two terms that belong here are added back from their
+    # exact sizes. So the reported number is what a fresh process would peak
+    # at, whoever else is holding memory in this one -- and release_cell no
+    # longer has to succeed at freeing everything for the row to be right.
+    # Gradients are outside the baseline (zero_grad above), so they are counted
+    # where they belong: in the transient.
     peak_fwd = peak_bwd = peak_step = 0
     for _ in range(2):
         opt.zero_grad(set_to_none=True)
         reset_memory(device)
+        base = allocated_memory(device)
         _, loss = model(X, Y)
-        peak_fwd = max(peak_fwd, peak_memory(device))
+        peak_fwd = max(peak_fwd, peak_memory(device) - base)
         loss.backward()
-        peak_bwd = max(peak_bwd, peak_memory(device))  # peak over fwd+bwd
+        peak_bwd = max(peak_bwd, peak_memory(device) - base)  # over fwd+bwd
         opt.step()
-        peak_step = max(peak_step, peak_memory(device))  # + the update
+        peak_step = max(peak_step, peak_memory(device) - base)  # + the update
     opt_state_bytes = sum(v.numel() * v.element_size()
                           for st in opt.state.values() for v in st.values()
                           if t.is_tensor(v))
     opt.zero_grad(set_to_none=True)
+
+    resident = param_bytes + opt_state_bytes   # what `base` held of our own
+    peak_fwd += resident
+    peak_bwd += resident
+    peak_step += resident
 
     steps_per_epoch = max(1, len(ds.splits["train"]) //
                           (batch * cfg.block_size))
@@ -884,6 +919,11 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
 
     gen = t.Generator().manual_seed(cfg.seed)  # identical batch stream per arm
     reset_memory(device)
+    # same baseline trick as bench_cell: the arm's peak is charged against what
+    # was live when it started, and its own parameters are added back from
+    # their exact size. AdamW's states are allocated lazily inside the loop, so
+    # they land in the transient and must not be added a second time
+    mem_base = allocated_memory(device)
 
     run = tracking.Run("train", arm.name, tags=[arm.kind, MODE_TAG[mode]],
                        config={**asdict(arm), **asdict(cfg),
@@ -984,7 +1024,7 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
                     f"  {ms:.1f} ms/it")
     bar.close()
 
-    mem = peak_memory(device)
+    mem = peak_memory(device) - mem_base + param_bytes
     ranks = comera.rank_report(raw_model)
 
     try:
