@@ -6,7 +6,7 @@ All model projections are tensorized via TT decomposition. Adaptiveness comes fr
 ## NanoGPT (5M)
 
 ### Results
-![](imgs\pareto_nanogpt.png)
+![](imgs/pareto_nanogpt.png)
 
 ### Wall-clock time
 
@@ -59,7 +59,7 @@ Right diagrams - gradients of cores and mean rank dynamics.
 
 ### Results
 
-![](imgs\pareto_gpt2.png)
+![](img/spareto_gpt2.png)
 
 ### Wall-clock time
 
