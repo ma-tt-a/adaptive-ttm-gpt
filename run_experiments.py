@@ -772,10 +772,15 @@ def run_bench(cfg: TrainConfig, ds: data.Dataset, device: t.device,
 # recorded lands in core_stats.csv; the plot shows one role because a panel
 # with 4 roles x 2d cores is unreadable.
 CORE_DIAG_PLOT_ROLE = "c_fc"
+# every block is recorded; the figure draws at most this many of them, evenly
+# spaced with the two ends always in, because a 12-block model would otherwise
+# be a 30-inch-tall png. Depth detail is in core_stats.csv
+CORE_DIAG_PLOT_BLOCKS = 4
 # line panels, one line per core. std and absmax used to live here too; a
 # summary statistic of a roughly symmetric distribution says little that the
 # percentile bands below do not say better
 CORE_DIAG_FIELDS = [("grad_norm", "grad norm", True),
+                    ("rank_grad_norm", "rank param grad norm", True),
                     ("rank_mean", "rank param mean", False)]
 
 # band panels: the value distribution of a group of cores, as percentiles of
@@ -803,15 +808,13 @@ def core_groups(cores: List[t.Tensor]):
 
 def diag_layers(model: GPT, cfg: TrainConfig) -> List[Tuple[str, TTLinear]]:
     """
-    The TT layers sampled during training: every role in the first, middle and
-    last block, so a drift that only hits one end of the model is visible.
+    The TT layers sampled during training: every role of every block. The
+    snapshot is still one synchronize whatever the count, and depth is exactly
+    the axis a per-block drift lives on, so the whole model is probed rather
+    than a first/middle/last sample of it.
     """
-    probe = sorted({0, cfg.n_layer // 2, cfg.n_layer - 1})
-    layers = []
-    for name, m in model.named_modules():
-        if isinstance(m, TTLinear) and parse_layer_name(name)[0] in probe:
-            layers.append((name, m))
-    return layers
+    return [(name, m) for name, m in model.named_modules()
+            if isinstance(m, TTLinear)]
 
 
 @t.no_grad()
@@ -819,8 +822,14 @@ def core_snapshot(layers: List[Tuple[str, TTLinear]],
                   it: int) -> Tuple[List[dict], List[dict]]:
     """
     Two views of the same moment: one row per core (summary statistics, the
-    gradient, and the rank parameter gating its trailing bond) and one row per
-    core group (percentiles of the concatenated entries).
+    gradient, and the rank parameter gating its trailing bond together with
+    its own gradient) and one row per core group (percentiles of the
+    concatenated entries).
+
+    The rank gradient is the one that decides whether the adaptive scheme
+    prunes at all: it carries the task term and the `gamma * rank_loss` term
+    together, and if it never outweighs Adam's step cap the mask entries do
+    not reach `threshold` inside the iteration budget.
 
     The percentiles are taken over the concatenation rather than averaged
     across per-core percentiles, which would not be a percentile of anything.
@@ -842,12 +851,15 @@ def core_snapshot(layers: List[Tuple[str, TTLinear]],
             zero = t.zeros((), device=G.device)
             g = G.grad
             r = rank_params[n] if n < len(rank_params) else None
+            rg = r.grad if r is not None else None
             stats.append(t.stack([
                 G.mean(), G.std(), G.abs().max(), G.norm(),
                 g.norm() if g is not None else nan,
                 r.mean() if r is not None else nan,
                 r.min() if r is not None else nan,
                 (r > thr).sum().float() if r is not None else zero,
+                rg.norm() if rg is not None else nan,
+                rg.abs().max() if rg is not None else nan,
             ]))
             meta.append((name, n))
 
@@ -861,18 +873,20 @@ def core_snapshot(layers: List[Tuple[str, TTLinear]],
 
     # one read-back for both tables
     nstat, nq = len(stats), len(CORE_DIAG_QUANTILES)
+    nfield = stats[0].numel()
     flat = t.cat([t.stack(stats).reshape(-1),
                   t.stack(dist).reshape(-1)]).cpu().tolist()
-    core_vals, dist_vals = flat[:nstat * 8], flat[nstat * 8:]
+    core_vals, dist_vals = flat[:nstat * nfield], flat[nstat * nfield:]
 
     rows = []
     for i, (name, n) in enumerate(meta):
-        v = core_vals[i * 8:(i + 1) * 8]
+        v = core_vals[i * nfield:(i + 1) * nfield]
         block, role = parse_layer_name(name)
         rows.append({"iter": it, "layer": name, "block": block, "role": role,
                      "core": n, "mean": v[0], "std": v[1], "absmax": v[2],
                      "norm": v[3], "grad_norm": v[4], "rank_mean": v[5],
-                     "rank_min": v[6], "rank_alive": v[7]})
+                     "rank_min": v[6], "rank_alive": v[7],
+                     "rank_grad_norm": v[8], "rank_grad_absmax": v[9]})
 
     drows = []
     labels = [PCT_LABEL % int(q * 100) for q in CORE_DIAG_QUANTILES]
@@ -896,14 +910,14 @@ def core_track_metrics(core_snap: List[dict],
     per-core detail is in core_stats.csv / core_dist.csv.
     """
     out: Dict[str, float] = {}
-    grads = [r["grad_norm"] for r in core_snap
-             if math.isfinite(r.get("grad_norm", float("nan")))]
-    if grads:
-        out["core/grad_norm"] = sum(grads) / len(grads)
-    ranks = [r["rank_mean"] for r in core_snap
-             if math.isfinite(r.get("rank_mean", float("nan")))]
-    if ranks:
-        out["core/rank_mean"] = sum(ranks) / len(ranks)
+    for field, key in [("grad_norm", "core/grad_norm"),
+                       ("rank_grad_norm", "core/rank_grad_norm"),
+                       ("rank_grad_absmax", "core/rank_grad_absmax"),
+                       ("rank_mean", "core/rank_mean")]:
+        vals = [r[field] for r in core_snap
+                if math.isfinite(r.get(field, float("nan")))]
+        if vals:
+            out[key] = sum(vals) / len(vals)
     for group, _ in CORE_DIST_GROUPS:
         mine = [r for r in dist_snap if r["group"] == group]
         if not mine:
@@ -1344,10 +1358,11 @@ RANK_SUMMARY_FMT = {"pruned_frac": ".3f", "rank_mean": ".2f", "lr_rank": ".0e",
 
 CORE_COLUMNS = ["arm", "family", "iter", "layer", "block", "role", "core",
                 "mean", "std", "absmax", "norm", "grad_norm", "rank_mean",
-                "rank_min", "rank_alive"]
+                "rank_min", "rank_alive", "rank_grad_norm", "rank_grad_absmax"]
 CORE_FMT = {"mean": ".3e", "std": ".3e", "absmax": ".3e", "norm": ".3e",
             "grad_norm": ".3e", "rank_mean": ".4f", "rank_min": ".4f",
-            "rank_alive": ".0f"}
+            "rank_alive": ".0f", "rank_grad_norm": ".3e",
+            "rank_grad_absmax": ".3e"}
 
 CORE_DIST_COLUMNS = (["arm", "family", "iter", "layer", "block", "role",
                       "group"]
@@ -1717,10 +1732,23 @@ def core_bands(ax, rows: List[dict], legend: bool = False):
         ax.legend(fontsize=6)
 
 
+def plot_blocks(blocks: List[int],
+                limit: int = CORE_DIAG_PLOT_BLOCKS) -> List[int]:
+    """
+    At most `limit` of the recorded blocks, evenly spaced and keeping the first
+    and the last -- the ends are where a depth drift shows first.
+    """
+    if len(blocks) <= limit:
+        return blocks
+    idx = {round(i * (len(blocks) - 1) / (limit - 1)) for i in range(limit)}
+    return [blocks[i] for i in sorted(idx)]
+
+
 def plot_core_diag(rows: List[dict], dist_rows: List[dict]):
     """
-    How the cores move during training: one figure per arm, one row per probed
-    block, and for the CORE_DIAG_PLOT_ROLE layer three value-distribution
+    How the cores move during training: one figure per arm, one row per plotted
+    block (a `plot_blocks` sample of the recorded ones), and for the
+    CORE_DIAG_PLOT_ROLE layer three value-distribution
     panels (left half of the chain, the two centre cores, right half) next to
     the per-core gradient norm and rank parameter.
 
@@ -1737,7 +1765,8 @@ def plot_core_diag(rows: List[dict], dist_rows: List[dict]):
                 if r["arm"] == arm and r["role"] == CORE_DIAG_PLOT_ROLE]
         if not mine:
             continue
-        blocks = sorted({r["block"] for r in mine})
+        blocks = plot_blocks(sorted({r["block"] for r in mine}))
+        mine = [r for r in mine if r["block"] in blocks]
         ncores = max(r["core"] for r in mine) + 1
         dmine = [r for r in dist_rows
                  if r["arm"] == arm and r["role"] == CORE_DIAG_PLOT_ROLE]
@@ -1760,7 +1789,11 @@ def plot_core_diag(rows: List[dict], dist_rows: List[dict]):
                     field, title, logy = panel
                     positive = True
                     for c in range(ncores):
-                        pts = sorted((r["iter"], r[field]) for r in mine
+                        # .get: an arm cached before a field existed keeps the
+                        # diagnostics it was trained with, and simply has no
+                        # line in that panel
+                        pts = sorted((r["iter"], r.get(field, float("nan")))
+                                     for r in mine
                                      if r["block"] == b and r["core"] == c)
                         ys = [y for _, y in pts if math.isfinite(y)]
                         if not ys:
