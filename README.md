@@ -59,7 +59,7 @@ Right diagrams - gradients of cores and mean rank dynamics.
 
 ### Results
 
-![](img/spareto_gpt2.png)
+![](imgs/pareto_gpt2.png)
 
 ### Wall-clock time
 
