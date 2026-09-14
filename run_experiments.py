@@ -446,6 +446,29 @@ def config_hash(arm: Arm, cfg: TrainConfig) -> str:
     return hash_payload(asdict(arm), cfg_d)
 
 
+def finite(v) -> bool:
+    """
+    A usable number. Records read back from the cache carry None where the
+    measurement was NaN/inf, so every reader checks through here
+    """
+    return isinstance(v, (int, float)) and math.isfinite(v)
+
+
+def json_safe(obj):
+    """
+    NaN / inf -> null, recursively. json.dump writes them as bare NaN by
+    default, which is not JSON: strict parsers (jq, JSON.parse, pandas'
+    engine) reject the whole file
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [json_safe(v) for v in obj]
+    return obj
+
+
 def cached_or_compute(path: str, want: str, compute, force: bool, tag: str,
                       allowed: bool) -> Optional[dict]:
     """
@@ -479,7 +502,7 @@ def cached_or_compute(path: str, want: str, compute, force: bool, tag: str,
         return None
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(rec, f, indent=1)
+        json.dump(json_safe(rec), f, indent=1, allow_nan=False)
     return rec
 
 
@@ -901,16 +924,16 @@ def core_track_metrics(core_snap: List[dict],
     """
     out: Dict[str, float] = {}
     grads = [r["grad_norm"] for r in core_snap
-             if math.isfinite(r.get("grad_norm", float("nan")))]
+             if finite(r.get("grad_norm"))]
     if grads:
         out["core/grad_norm"] = sum(grads) / len(grads)
     for b in sorted({r["block"] for r in core_snap}):
         g = [r["grad_norm"] for r in core_snap if r["block"] == b
-             and math.isfinite(r.get("grad_norm", float("nan")))]
+             and finite(r.get("grad_norm"))]
         if g:
             out[f"core/grad_norm/block{b}"] = sum(g) / len(g)
     ranks = [r["rank_mean"] for r in core_snap
-             if math.isfinite(r.get("rank_mean", float("nan")))]
+             if finite(r.get("rank_mean"))]
     if ranks:
         out["core/rank_mean"] = sum(ranks) / len(ranks)
     for group, _ in CORE_DIST_GROUPS:
@@ -2128,7 +2151,8 @@ def core_bands(ax, rows: List[dict], legend: bool = False):
         return
     xs = [r["iter"] for r in pts]
     lo, q1, med, q3, hi = (
-        [[r[PCT_LABEL % int(q * 100)] for r in pts]
+        [[v if finite(v := r[PCT_LABEL % int(q * 100)]) else float("nan")
+          for r in pts]
          for q in CORE_DIAG_QUANTILES])
     ax.fill_between(xs, lo, hi, color="#1f77b4", alpha=0.18,
                     label="p1-p99" if legend else None)
@@ -2188,7 +2212,9 @@ def plot_core_diag(rows: List[dict], dist_rows: List[dict]):
                     for c in range(ncores):
                         pts = sorted((r["iter"], r[field]) for r in mine
                                      if r["block"] == b and r["core"] == c)
-                        ys = [y for _, y in pts if math.isfinite(y)]
+                        pts = [(x, y if finite(y) else float("nan"))
+                               for x, y in pts]
+                        ys = [y for _, y in pts if finite(y)]
                         if not ys:
                             continue
                         positive = positive and all(y > 0 for y in ys)
@@ -2313,7 +2339,7 @@ def summarize(bench: List[dict], train: List[dict], summaries: List[dict],
 
     if cores:
         def avg(xs):
-            xs = [x for x in xs if math.isfinite(x)]
+            xs = [x for x in xs if finite(x)]
             return sum(xs) / len(xs) if xs else float("nan")
 
         print("\ncores: first -> last snapshot, averaged over probed layers")
@@ -2324,11 +2350,12 @@ def summarize(bench: List[dict], train: List[dict], summaries: List[dict],
             s0 = avg([r["std"] for r in mine if r["iter"] == it0])
             s1 = avg([r["std"] for r in mine if r["iter"] == it1])
             gn = avg([r["grad_norm"] for r in mine if r["iter"] == it1])
-            mx = max((r["absmax"] for r in mine if r["iter"] == it1),
+            mx = max((r["absmax"] for r in mine
+                      if r["iter"] == it1 and finite(r["absmax"])),
                      default=float("nan"))
             bad = sum(1 for r in mine
-                      if not math.isfinite(r["std"])
-                      or not math.isfinite(r["grad_norm"]))
+                      if not finite(r["std"])
+                      or not finite(r["grad_norm"]))
             print(f"      {arm:<24s} std {s0:.2e} -> {s1:.2e} "
                   f"(x{s1/s0:5.2f})  |max| {mx:.2e}  |grad| {gn:.2e}"
                   + (f"  ! {bad} non-finite" if bad else ""))
