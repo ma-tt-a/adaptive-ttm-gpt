@@ -17,8 +17,9 @@ interrupted colab session resumes where it stopped (--force recomputes):
             the pruned fraction as a function of lr_rank and starting max_rank.
   5 cores   how the TT cores themselves behave during training: mean / std /
             |max| / gradient norm of every core of the probed layers (every
-            role in the first, middle and last block), sampled every
-            core_diag_interval iterations.
+            role in every block), sampled every core_diag_interval
+            iterations; plus, for adaptive arms, every lambda and its
+            gradient (see RankTracer).
 
     python run_experiments.py --smoke          # toy scale, minutes
     python run_experiments.py --phases bench   # cheap, run this first
@@ -43,6 +44,7 @@ import os
 import re
 import sys
 import time
+import traceback
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
 
@@ -74,6 +76,8 @@ MODE_LABEL = {None: "eager",
 MODE_FROM_TAG = {v: k for k, v in MODE_TAG.items()}
 
 RESULTS = "results"
+# live per-arm training logs: tmp/<session>/train_<arm>_<mode>_<hash>.txt
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
 RUNS_DIR = os.path.join(RESULTS, "runs")
 TABLES_DIR = os.path.join(RESULTS, "tables")
 PLOTS_DIR = os.path.join(RESULTS, "plots")
@@ -193,6 +197,9 @@ class TrainConfig:
     init_std: float = 2e-2
     sample_tokens: int = 200
     core_diag_interval: int = 100  # iterations between core snapshots; 0 = off
+    # iterations between full lambda / lambda-gradient snapshots (adaptive arms);
+    # the alive counts are recorded every step regardless. 0 = off
+    rank_diag_interval: int = 100
     # tf32 by default: on an Ampere-or-newer cuda device this is the tensor-core
     # path for float32 matmuls, and it is what the target hardware would
     # actually train in. It is part of the config, not a global flag, so it goes
@@ -223,7 +230,7 @@ class TrainConfig:
             log_interval=25,
             eval_iters=5, warmup_iters=5, warmup_timing=5,
             n_layer=2, n_head=4, n_embd=64, sample_tokens=64,
-            core_diag_interval=10,
+            core_diag_interval=10, rank_diag_interval=10,
             init_std=self.init_std, seed=self.seed,
             matmul_precision=self.matmul_precision,
             dataset=self.dataset, data_tokens=self.data_tokens,
@@ -409,7 +416,7 @@ def hash_payload(*parts) -> str:
 # kept out of the fingerprint so retuning the diagnostics does not invalidate
 # hours of cached training runs -- the price is that a cached record keeps
 # whatever diagnostics it was computed with (--force to resample).
-HASH_IGNORED = ("core_diag_interval",)
+HASH_IGNORED = ("core_diag_interval", "rank_diag_interval")
 
 # defaults of fields added after the cache already existed. A run that leaves
 # one alone measures exactly what the old code measured, so the field is
@@ -803,15 +810,12 @@ def core_groups(cores: List[t.Tensor]):
 
 def diag_layers(model: GPT, cfg: TrainConfig) -> List[Tuple[str, TTLinear]]:
     """
-    The TT layers sampled during training: every role in the first, middle and
-    last block, so a drift that only hits one end of the model is visible.
+    The TT layers sampled during training: every role in every block. The
+    figure narrows to CORE_DIAG_PLOT_BLOCKS; the csv keeps all of them, since a
+    collapse confined to the last blocks is exactly what three probes can miss.
     """
-    probe = sorted({0, cfg.n_layer // 2, cfg.n_layer - 1})
-    layers = []
-    for name, m in model.named_modules():
-        if isinstance(m, TTLinear) and parse_layer_name(name)[0] in probe:
-            layers.append((name, m))
-    return layers
+    return [(name, m) for name, m in model.named_modules()
+            if isinstance(m, TTLinear)]
 
 
 @t.no_grad()
@@ -900,6 +904,11 @@ def core_track_metrics(core_snap: List[dict],
              if math.isfinite(r.get("grad_norm", float("nan")))]
     if grads:
         out["core/grad_norm"] = sum(grads) / len(grads)
+    for b in sorted({r["block"] for r in core_snap}):
+        g = [r["grad_norm"] for r in core_snap if r["block"] == b
+             and math.isfinite(r.get("grad_norm", float("nan")))]
+        if g:
+            out[f"core/grad_norm/block{b}"] = sum(g) / len(g)
     ranks = [r["rank_mean"] for r in core_snap
              if math.isfinite(r.get("rank_mean", float("nan")))]
     if ranks:
@@ -922,8 +931,274 @@ def core_rows(rec: dict, key: str = "core_diag") -> List[dict]:
             for r in rec.get(key, [])]
 
 
+# ============================================================================
+# rank-parameter trace (adaptive arms)
+# ============================================================================
+
+class RankTracer:
+    """
+    Every lambda of every TT layer, laid out as one flat vector in module order.
+
+    Two cadences:
+      - every step: alive count per bond, their total N (the denominator of
+        comera.rank_loss, so gamma / N is the coefficient of the rank-loss
+        gradient) and the pre-clip global gradient norm;
+      - every rank_diag_interval: lambda itself, its total gradient, and the
+        task part of that gradient.
+
+    Both are read before clip_grad_norm_, i.e. they are the gradient of the
+    loss, not what AdamW receives. The rank-loss part is known in closed form
+    -- d/dlambda_i [gamma * sum(threshold(x)) / N] = gamma / N on alive entries
+    (N is a count, it carries no gradient) -- so the task part is the
+    difference and costs no second backward. A dead entry has zero gradient
+    from both terms: F.threshold zeroes it, so only Adam's momentum moves it.
+
+    Nothing synchronizes until flush(): the per-step tensors stay on device.
+    """
+
+    def __init__(self, model: GPT, gamma: float):
+        self.gamma = gamma
+        self.layout: List[Tuple[str, int, int]] = []   # (layer, bond, size)
+        self.params: List[t.Tensor] = []
+        tols, bonds = [], []
+        for name, m in model.named_modules():
+            if not (isinstance(m, TTLinear) and m.rank_params is not None):
+                continue
+            for n, p in enumerate(m.rank_params):
+                tols.append(t.full((p.numel(),), m.cfg.threshold))
+                bonds.append(t.full((p.numel(),), len(self.layout),
+                                    dtype=t.long))
+                self.layout.append((name, n, p.numel()))
+                self.params.append(p)
+        device = self.params[0].device
+        self.tol = t.cat(tols).to(device)
+        self.bond = t.cat(bonds).to(device)
+        self.block = t.tensor([parse_layer_name(name)[0]
+                               for name, _, _ in self.layout])
+        sizes = t.tensor([size for _, _, size in self.layout])
+        self.elem_block = t.repeat_interleave(self.block, sizes)
+        self.nblock = int(self.block.max()) + 1
+        self.block_size = t.zeros(self.nblock).index_add_(
+            0, self.block, sizes.float())
+        # flushed (cpu) and pending (device) halves of the same series
+        self.steps: List[int] = []
+        self.alive: List[t.Tensor] = []
+        self.norms: List[t.Tensor] = []
+        self.snap_iters: List[int] = []
+        self.snaps: List[t.Tensor] = []
+        self._steps, self._alive, self._norms = [], [], []
+        self._snap_iters, self._snaps = [], []
+
+    @t.no_grad()
+    def observe(self, it: int, snapshot: bool):
+        """
+        After the last backward of the step, before clipping
+        """
+        x = t.cat([p.reshape(-1) for p in self.params])
+        live = x > self.tol
+        alive = t.zeros(len(self.layout), dtype=t.int32,
+                        device=x.device).index_add_(0, self.bond, live.int())
+        self._steps.append(it)
+        self._alive.append(alive)
+        if snapshot:
+            g = t.cat([(p.grad if p.grad is not None
+                        else t.zeros_like(p)).reshape(-1)
+                       for p in self.params])
+            g_rank = self.gamma / alive.sum().clamp(min=1) * live
+            self._snap_iters.append(it)
+            self._snaps.append(t.stack([x, g, g - g_rank]))
+
+    def grad_norm(self, norm: t.Tensor):
+        self._norms.append(norm.detach().float().reshape(()))
+
+    def flush(self, run: tracking.Run):
+        """
+        One read-back for everything pending, then the dashboard series
+        """
+        if not self._steps:
+            return
+        alive = t.stack(self._alive).cpu()
+        norms = t.stack([n.to(alive.device) for n in self._norms]).cpu()
+        snaps = t.stack(self._snaps).cpu() if self._snaps else None
+        steps, snap_iters = self._steps, self._snap_iters
+        self._steps, self._alive, self._norms = [], [], []
+        self._snap_iters, self._snaps = [], []
+
+        self.steps.extend(steps)
+        self.alive.append(alive.to(t.int16))
+        self.norms.append(norms)
+        if snaps is not None:
+            self.snap_iters.extend(snap_iters)
+            self.snaps.append(snaps)
+
+        kept = t.zeros(len(steps), self.nblock).index_add_(
+            1, self.block, alive.float()) / self.block_size
+        snap_at = {it: k for k, it in enumerate(snap_iters)}
+        tol = self.tol.cpu()
+        for i, it in enumerate(steps):
+            n = int(alive[i].sum())
+            out = {"rank/N": n, "rank/coef": self.gamma / max(n, 1),
+                   "rank/grad_norm_preclip": float(norms[i])}
+            out.update({f"rank/kept/block{b}": float(kept[i, b])
+                        for b in range(self.nblock)})
+            if it in snap_at:
+                out.update(rank_snap_metrics(snaps[snap_at[it]], tol,
+                                             self.elem_block, self.nblock))
+            run.log(out, it)
+
+    def record(self) -> dict:
+        empty = t.zeros(0)
+        return {
+            "layout": self.layout,
+            "gamma": self.gamma,
+            "threshold": self.tol.cpu(),
+            "step_iter": t.tensor(self.steps, dtype=t.long),
+            # (steps, bonds)
+            "alive": t.cat(self.alive) if self.alive else empty,
+            "grad_norm": t.cat(self.norms) if self.norms else empty,
+            "snap_iter": t.tensor(self.snap_iters, dtype=t.long),
+            # (snapshots, 3, #lambda): lambda, total grad, task grad
+            "snaps": t.cat(self.snaps) if self.snaps else empty,
+        }
+
+
+def rank_snap_metrics(snap: t.Tensor, tol: t.Tensor, block: t.Tensor,
+                      nblock: int) -> Dict[str, float]:
+    """
+    Per block, over the alive lambdas: mean lambda, mean |task grad|, and the
+    fraction the total gradient pushes down (grad > 0). Adam normalizes each
+    entry, so it is that sign -- task grad against gamma / N -- that decides
+    whether a bond shrinks, not the gradient's magnitude.
+    """
+    lam, grad, task = snap
+    live = lam > tol
+    out = {}
+    for b in range(nblock):
+        sel = live & (block == b)
+        if not bool(sel.any()):
+            continue
+        out[f"rank/lambda_mean/block{b}"] = float(lam[sel].mean())
+        out[f"rank/task_grad_abs/block{b}"] = float(task[sel].abs().mean())
+        out[f"rank/down_frac/block{b}"] = float((grad[sel] > 0).float().mean())
+    return out
+
+
+def load_rank_trace(rec: dict) -> Optional[dict]:
+    name = rec.get("rank_trace")
+    path = os.path.join(RUNS_DIR, name) if name else None
+    if not path or not os.path.exists(path):
+        return None
+    return t.load(path, weights_only=True)
+
+
+def rank_trace_rows(rec: dict, trace: dict) -> Tuple[List[dict], List[dict]]:
+    """
+    rank_steps.csv: one row per step. rank_lambda.csv: one row per snapshot x
+    bond, lambdas and gradients summarized -- the individual values stay in the
+    .rank.pt, since at gpt2-small they are ~8k per snapshot.
+    """
+    gamma = trace["gamma"]
+    tag = {"arm": rec["arm"], "family": rec["family"]}
+    n_alive = trace["alive"].int().sum(1).tolist()
+    step_iter = trace["step_iter"].tolist()
+    steps = [dict(tag, iter=it, n_alive=n, coef=gamma / max(n, 1),
+                  grad_norm=g)
+             for it, n, g in zip(step_iter, n_alive,
+                                 trace["grad_norm"].tolist())]
+
+    sizes = [size for _, _, size in trace["layout"]]
+    n_at = dict(zip(step_iter, n_alive))
+    tol = trace["threshold"].split(sizes)
+    bonds = []
+    for k, it in enumerate(trace["snap_iter"].tolist()):
+        coef = gamma / max(n_at[it], 1)
+        lam, grad, task = (v.split(sizes) for v in trace["snaps"][k])
+        for j, (name, bond, size) in enumerate(trace["layout"]):
+            block, role = parse_layer_name(name)
+            live = lam[j] > tol[j]
+            alive = int(live.sum())
+            bonds.append(dict(
+                tag, iter=it, layer=name, block=block, role=role, bond=bond,
+                size=size, alive=alive, coef=coef,
+                lam_mean=float(lam[j].mean()), lam_min=float(lam[j].min()),
+                lam_max=float(lam[j].max()), grad_mean=float(grad[j].mean()),
+                task_grad_mean=float(task[j].mean()),
+                task_grad_min=float(task[j].min()),
+                task_grad_max=float(task[j].max()),
+                down_frac=(float((grad[j][live] > 0).float().mean())
+                           if alive else float("nan"))))
+    return steps, bonds
+
+
+def plot_rank_trace(rec: dict, trace: dict):
+    """
+    Whether lambda is pruned by the task or by the regularizer: N and gamma / N
+    per step, kept fraction per block per step, and at the snapshots the task
+    gradient against gamma / N and the fraction of alive lambdas pushed down.
+    """
+    if not len(trace["step_iter"]):
+        return
+    plt = _plt()
+    steps, bonds = rank_trace_rows(rec, trace)
+    xs = [r["iter"] for r in steps]
+    layer_block = [parse_layer_name(n)[0] for n, _, _ in trace["layout"]]
+    blocks = sorted(set(layer_block))
+    cmap = plt.get_cmap("viridis")
+    color = {b: cmap(i / max(len(blocks) - 1, 1)) for i, b in enumerate(blocks)}
+
+    fig, axes = plt.subplots(1, 4, figsize=(17, 3.6))
+    ax = axes[0]
+    ax.plot(xs, [r["n_alive"] for r in steps], color="#1f77b4", lw=1.2)
+    ax.set_ylabel("N alive", color="#1f77b4")
+    ax2 = ax.twinx()
+    ax2.plot(xs, [r["coef"] for r in steps], color="#d62728", lw=1.0)
+    ax2.set_ylabel("gamma / N", color="#d62728")
+    ax2.set_yscale("log")
+    ax.set_title("N and the rank-gradient coefficient", fontsize=9)
+
+    sizes = [size for _, _, size in trace["layout"]]
+    alive = trace["alive"].float()
+    for b in blocks:
+        idx = [j for j, lb in enumerate(layer_block) if lb == b]
+        total = sum(sizes[j] for j in idx)
+        axes[1].plot(xs, (alive[:, idx].sum(1) / total).tolist(),
+                     color=color[b], lw=1.0, label=f"block {b}")
+    axes[1].set_title("kept fraction per block", fontsize=9)
+    axes[1].legend(fontsize=6, ncol=2)
+
+    for b in blocks:
+        pts: Dict[int, List[dict]] = {}
+        for r in bonds:
+            if r["block"] == b and r["alive"]:
+                pts.setdefault(r["iter"], []).append(r)
+        its = sorted(pts)
+        axes[2].plot(its, [sum(abs(r["task_grad_mean"]) for r in pts[i])
+                           / len(pts[i]) for i in its],
+                     color=color[b], lw=1.0)
+        axes[3].plot(its, [sum(r["down_frac"] * r["alive"] for r in pts[i])
+                           / sum(r["alive"] for r in pts[i]) for i in its],
+                     color=color[b], lw=1.0)
+    coef = sorted({(r["iter"], r["coef"]) for r in bonds})
+    axes[2].plot([i for i, _ in coef], [c for _, c in coef], color="black",
+                 ls="--", lw=1.0, label="gamma / N")
+    if axes[2].lines:
+        axes[2].set_yscale("log")
+        axes[2].legend(fontsize=6)
+    axes[2].set_title("|mean task grad| per bond vs gamma / N", fontsize=9)
+    axes[3].axhline(0.5, color="#999999", lw=0.6, ls=":")
+    axes[3].set_title("alive lambdas pushed down (grad > 0)", fontsize=9)
+    for ax in axes:
+        ax.grid(alpha=0.3)
+        ax.set_xlabel("iteration", fontsize=8)
+    fig.suptitle(f"{rec['arm']} -- rank parameters through training",
+                 fontsize=11)
+    save(fig, f"6b_ranks_{rec['arm']}.png")
+
+
 def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
-              ds: data.Dataset, device: t.device) -> dict:
+              ds: data.Dataset, device: t.device,
+              trace_path: Optional[str] = None,
+              log: Optional["ArmLog"] = None) -> dict:
     """
     Train one arm and collect every measurement the plots need
     """
@@ -958,14 +1233,15 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
                                "device": str(device),
                                "nominal_params": nominal_params,
                                "param_mb": param_bytes / 1e6,
-                               "effective_batch": cfg.effective_batch,
-                               "tokens_per_step": cfg.tokens_per_step})
+                               **data_info(cfg, ds)})
 
     history = {"iter": [], "train": [], "val": [], "eff_params": [],
                "eff_size": [], "rank_loss": []}
     probed = diag_layers(raw_model, cfg) if cfg.core_diag_interval else []
     core_diag: List[dict] = []
     core_dist: List[dict] = []
+    tracer = (RankTracer(raw_model, arm.gamma)
+              if arm.adaptive and trace_path else None)
     step_times: List[float] = []
     first_step_time = None
 
@@ -996,10 +1272,24 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
                 if micro == cfg.grad_accum - 1:
                     loss = comera.comera_loss(loss, raw_model, arm.gamma)
                 loss.backward()
+            # before clipping: the gradient of the loss, not AdamW's input
+            if tracer:
+                tracer.observe(it, cfg.rank_diag_interval > 0 and (
+                    it % cfg.rank_diag_interval == 0
+                    or it == cfg.max_iters - 1))
             if cfg.grad_clip > 0:
-                t.nn.utils.clip_grad_norm_(
+                norm = t.nn.utils.clip_grad_norm_(
                     raw_model.parameters(), cfg.grad_clip)
+            else:
+                norm = t.full((), float("nan"))
+            if tracer:
+                tracer.grad_norm(norm)
             opt.step()
+        # before anything else logs this iteration: the flush logs every
+        # buffered step up to and including it
+        if tracer and (it % cfg.eval_interval == 0
+                       or it == cfg.max_iters - 1):
+            tracer.flush(run)
         # after opt.step(), so the gradients of this step are still live
         if probed and (it % cfg.core_diag_interval == 0
                        or it == cfg.max_iters - 1):
@@ -1043,15 +1333,24 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
             if not first and (due or it == cfg.max_iters - 1):
                 last_logged = it
                 ms = median(step_times) * 1e3 if step_times else float("nan")
-                tqdm.write(
-                    f"    {arm.name}/{MODE_TAG[mode]} it {it+1}/{cfg.max_iters}"
-                    f"  train {losses['train']:.4f}  val {losses['val']:.4f}"
-                    f"  eff {history['eff_params'][-1]/1e3:.0f}k"
-                    f"  {ms:.1f} ms/it")
+                line = (f"it {it+1}/{cfg.max_iters}"
+                        f"  tok {human_tokens((it + 1) * cfg.tokens_per_step)}"
+                        f"/{human_tokens(cfg.tokens_per_step * cfg.max_iters)}"
+                        f"  train {losses['train']:.4f}"
+                        f"  val {losses['val']:.4f}"
+                        f"  eff {history['eff_params'][-1]/1e3:.0f}k"
+                        f"  {ms:.1f} ms/it")
+                if log:
+                    log.write(line)
+                else:
+                    tqdm.write(f"    {arm.name}/{MODE_TAG[mode]} {line}")
     bar.close()
 
     mem = peak_memory(device) - mem_base + param_bytes
     ranks = comera.rank_report(raw_model)
+    if tracer:
+        os.makedirs(os.path.dirname(trace_path), exist_ok=True)
+        t.save(tracer.record(), trace_path)
 
     try:
         ctx = t.zeros((1, 1), dtype=t.long, device=device)
@@ -1116,9 +1415,11 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
                             if mode == "reduce-overhead" else 0),
         "memory_comparable": mode != "reduce-overhead",
         "diverged": not math.isfinite(final_val),
+        "data": data_info(cfg, ds),
         "history": history,
         "core_diag": core_diag,
         "core_dist": core_dist,
+        "rank_trace": os.path.basename(trace_path) if tracer else None,
         "init_ranks": init_ranks,
         "final_ranks": ranks,
         "sample": sample,
@@ -1140,27 +1441,129 @@ def token_budget(cfg: TrainConfig, ds: data.Dataset,
             "warmup_tokens": cfg.tokens_per_step * cfg.warmup_iters}
 
 
-def print_budget(cfg: TrainConfig, ds: data.Dataset, n_arms: int) -> None:
+def data_info(cfg: TrainConfig, ds: data.Dataset) -> dict:
     """
-    The line to read before committing a GPU-day: tokens, epochs over the
-    corpus, and how much of the run is warmup. Printed before the first arm
-    starts, since none of it is recoverable from the loss curve afterwards
+    What corpus an arm trained on and how much of it: the part of a run that
+    the loss curve cannot tell you afterwards
+    """
+    b = token_budget(cfg, ds)
+    streamed = cfg.dataset != "shakespeare"
+    return {"dataset": ds.name,
+            "data_subset": cfg.data_subset if streamed else None,
+            "data_tokens": cfg.data_tokens if streamed else None,
+            "train_tokens": b["train_tokens"],
+            "val_tokens": len(ds.splits["val"]),
+            "vocab_size": ds.vocab_size,
+            "max_iters": cfg.max_iters,
+            "micro_batch": cfg.batch_size,
+            "grad_accum": cfg.grad_accum,
+            "effective_batch": cfg.effective_batch,
+            "block_size": cfg.block_size,
+            "tokens_per_step": b["tokens_per_step"],
+            "tokens_per_arm": b["tokens_per_arm"],
+            "epochs": b["epochs"],
+            "warmup_iters": cfg.warmup_iters,
+            "warmup_tokens": b["warmup_tokens"]}
+
+
+def budget_lines(cfg: TrainConfig, ds: data.Dataset, n_arms: int) -> List[str]:
+    """
+    The lines to read before committing a GPU-day: tokens, epochs over the
+    corpus, and how much of the run is warmup
     """
     b = token_budget(cfg, ds, n_arms)
-    print(f"budget: {b['tokens_per_step']:,d} tokens/step "
-          f"({cfg.batch_size} micro x {cfg.grad_accum} accum x "
-          f"{cfg.block_size} ctx) x {cfg.max_iters:,d} iters = "
-          f"{human_tokens(b['tokens_per_arm'])} tokens per arm")
-    print(f"        {ds.name} train split {human_tokens(b['train_tokens'])} "
-          f"tokens -> {b['epochs']:.2f} epochs; warmup {cfg.warmup_iters} "
-          f"iters ({human_tokens(b['warmup_tokens'])} tokens, "
-          f"{cfg.warmup_iters / max(1, cfg.max_iters):.1%} of the run)")
+    corpus = ds.name + (f"/{cfg.data_subset}" if cfg.dataset != "shakespeare"
+                        else "")
+    lines = [f"budget: {b['tokens_per_step']:,d} tokens/step "
+             f"({cfg.batch_size} micro x {cfg.grad_accum} accum x "
+             f"{cfg.block_size} ctx) x {cfg.max_iters:,d} iters = "
+             f"{human_tokens(b['tokens_per_arm'])} tokens per arm",
+             f"        {corpus} train split {human_tokens(b['train_tokens'])} "
+             f"tokens -> {b['epochs']:.2f} epochs; warmup {cfg.warmup_iters} "
+             f"iters ({human_tokens(b['warmup_tokens'])} tokens, "
+             f"{cfg.warmup_iters / max(1, cfg.max_iters):.1%} of the run)"]
     if n_arms > 1:
-        print(f"        {n_arms} arms -> "
-              f"{human_tokens(b['tokens_total'])} tokens in total")
+        lines.append(f"        {n_arms} arms -> "
+                     f"{human_tokens(b['tokens_total'])} tokens in total")
     if b["epochs"] > 1.5 and ds.name != "shakespeare":
-        print(f"        ! {b['epochs']:.1f} passes over the corpus -- raise "
-              f"--data-tokens to keep the run single-epoch")
+        lines.append(f"        ! {b['epochs']:.1f} passes over the corpus -- "
+                     f"raise --data-tokens to keep the run single-epoch")
+    return lines
+
+
+def print_budget(cfg: TrainConfig, ds: data.Dataset, n_arms: int) -> None:
+    """
+    Printed before the first arm starts, since none of it is recoverable from
+    the loss curve afterwards
+    """
+    for line in budget_lines(cfg, ds, n_arms):
+        print(line)
+
+
+class ArmLog:
+    """
+    One training arm's progress, written live to a txt file instead of stdout.
+
+    Line-buffered and flushed on every write, so `tail -f` follows a running
+    arm; colab `!python` output stays readable because only the per-arm
+    summaries reach it. An exception is written to the file with its traceback
+    and re-raised, so cached_or_compute still reports the arm as FAILED.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+
+    def __enter__(self) -> "ArmLog":
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self.f = open(self.path, "a", buffering=1, encoding="utf-8")
+        return self
+
+    def write(self, line: str = ""):
+        self.f.write(f"[{time.strftime('%H:%M:%S')}] {line}\n")
+        self.f.flush()
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None:
+            self.write(f"FAILED -- {exc_type.__name__}: {exc}")
+            self.f.write("".join(traceback.format_exception(exc_type, exc, tb)))
+        self.f.close()
+        return False
+
+
+def log_header(log: ArmLog, arm: Arm, mode: Optional[str], cfg: TrainConfig,
+               ds: data.Dataset, device: t.device, want: str):
+    log.write(f"arm {arm.name}  kind {arm.kind}  compile {MODE_TAG[mode]}  "
+              f"config {want}")
+    if arm.tensorized:
+        log.write(f"max_rank {arm.max_rank}  gamma {arm.gamma:g}  "
+                  f"lr_rank {arm.lr_rank:g}")
+    log.write(f"device {device}  matmul {cfg.matmul_precision}  "
+              f"n_layer {cfg.n_layer} n_head {cfg.n_head} "
+              f"n_embd {cfg.n_embd}  lr {cfg.lr:g} (cores {cfg.lr_tensor:g})")
+    for line in budget_lines(cfg, ds, 1):
+        log.write(line)
+    log.write("data " + "  ".join(f"{k}={v}"
+                                  for k, v in data_info(cfg, ds).items()))
+    log.write("-" * 60)
+
+
+def log_footer(log: ArmLog, rec: dict):
+    log.write("-" * 60)
+    log.write(f"final val {rec['final_val_loss']:.4f}  "
+              f"ppl {rec['final_val_ppl']:.2f}  "
+              f"best val {rec['best_val_loss']:.4f}  "
+              f"train {rec['final_train_loss']:.4f}")
+    log.write(f"params {rec['effective_params']:,d} effective / "
+              f"{rec['nominal_params']:,d} nominal  "
+              f"step {rec['step_time_s']*1e3:.2f} ms  "
+              f"total {rec['total_train_s']/60:.1f} min  "
+              f"peak {rec['peak_memory_mb']:.1f} MB  "
+              f"compile {rec['compile_time_s']:.1f} s")
+    if rec["kind"] == "adaptive":
+        init = sum(sum(r) for r in rec["init_ranks"].values())
+        final = sum(sum(r) for r in rec["final_ranks"].values())
+        log.write(f"ranks {final}/{init} alive "
+                  f"({1 - final / max(init, 1):.1%} pruned)")
 
 
 def run_train(arms: List[Arm], cfg: TrainConfig, ds: data.Dataset,
@@ -1175,10 +1578,20 @@ def run_train(arms: List[Arm], cfg: TrainConfig, ds: data.Dataset,
         tag = f"{arm.name}_{MODE_TAG[mode]}"
         want = config_hash(arm, cfg)
         path = os.path.join(RUNS_DIR, f"train_{tag}_{want}.json")
-        rec = cached_or_compute(
-            path, want,
-            lambda a=arm, m=mode: train_arm(a, m, cfg, ds, device),
-            force, tag, allowed)
+        stem = f"train_{tag}_{want}"
+        log_path = os.path.join(LOG_DIR, tracking.config().group,
+                                stem + ".txt")
+
+        def compute(a=arm, m=mode, want=want, tag=tag, log_path=log_path):
+            tqdm.write(f"  {tag}: log -> {log_path}")
+            with ArmLog(log_path) as log:
+                log_header(log, a, m, cfg, ds, device, want)
+                rec = train_arm(a, m, cfg, ds, device,
+                                path[:-len(".json")] + ".rank.pt", log)
+                log_footer(log, rec)
+            return rec
+
+        rec = cached_or_compute(path, want, compute, force, tag, allowed)
         if rec is None:
             continue
         records.append(rec)
@@ -1324,8 +1737,10 @@ TRAIN_COLUMNS = ["arm", "family", "compile_mode", "max_rank", "lr_rank",
                  "nominal_params", "effective_params", "compression",
                  "final_val_loss", "final_val_ppl", "step_time_s",
                  "param_mb", "effective_param_mb", "peak_memory_mb",
-                 "compiled_frames", "graph_breaks"]
-TRAIN_FMT = {"nominal_params": ",d", "effective_params": ",d",
+                 "compiled_frames", "graph_breaks", "dataset", "data_subset",
+                 "max_iters", "tokens_per_arm", "epochs"]
+TRAIN_FMT = {"tokens_per_arm": ",d", "epochs": ".2f",
+             "nominal_params": ",d", "effective_params": ",d",
              "compression": ".2f", "final_val_loss": ".4f",
              "final_val_ppl": ".2f", "step_time_s": ".5f", "param_mb": ".2f",
              "effective_param_mb": ".2f", "peak_memory_mb": ".1f",
@@ -1348,6 +1763,12 @@ CORE_COLUMNS = ["arm", "family", "iter", "layer", "block", "role", "core",
 CORE_FMT = {"mean": ".3e", "std": ".3e", "absmax": ".3e", "norm": ".3e",
             "grad_norm": ".3e", "rank_mean": ".4f", "rank_min": ".4f",
             "rank_alive": ".0f"}
+
+RANK_STEP_COLUMNS = ["arm", "family", "iter", "n_alive", "coef", "grad_norm"]
+RANK_LAMBDA_COLUMNS = ["arm", "family", "iter", "layer", "block", "role",
+                       "bond", "size", "alive", "coef", "lam_mean", "lam_min",
+                       "lam_max", "grad_mean", "task_grad_mean",
+                       "task_grad_min", "task_grad_max", "down_frac"]
 
 CORE_DIST_COLUMNS = (["arm", "family", "iter", "layer", "block", "role",
                       "group"]
@@ -1372,6 +1793,9 @@ def decorate_train(records: List[dict]) -> List[dict]:
         r["compression"] = (base_params / r["effective_params"]
                             if base_params and r["effective_params"]
                             else float("nan"))
+        for k in ("dataset", "data_subset", "max_iters", "tokens_per_arm",
+                  "epochs"):
+            r.setdefault(k, r.get("data", {}).get(k))
     return records
 
 
@@ -1738,6 +2162,8 @@ def plot_core_diag(rows: List[dict], dist_rows: List[dict]):
         if not mine:
             continue
         blocks = sorted({r["block"] for r in mine})
+        # one row per block would be 12 rows at gpt2-small; the csv has them all
+        blocks = sorted({blocks[0], blocks[len(blocks) // 2], blocks[-1]})
         ncores = max(r["core"] for r in mine) + 1
         dmine = [r for r in dist_rows
                  if r["arm"] == arm and r["role"] == CORE_DIAG_PLOT_ROLE]
@@ -2031,6 +2457,12 @@ def main():
                          "10 under --smoke; 0 disables). Not part of the cache "
                          "key, so cached arms keep the diagnostics they were "
                          "trained with -- use --force to resample them")
+    ap.add_argument("--rank-diag-interval", type=int, default=None,
+                    help="iterations between full lambda / lambda-gradient "
+                         "snapshots of adaptive arms (default 100, 10 under "
+                         "--smoke; 0 keeps only the per-step alive counts). "
+                         "Written to results/runs/*.rank.pt; not part of the "
+                         "cache key")
     ap.add_argument("--core-diag-role", default=CORE_DIAG_PLOT_ROLE,
                     choices=ROLES,
                     help="which TT role the per-arm core figure draws. Every "
@@ -2118,6 +2550,8 @@ def main():
                                          / cfg.tokens_per_step))
     if args.core_diag_interval is not None:
         cfg.core_diag_interval = args.core_diag_interval
+    if args.rank_diag_interval is not None:
+        cfg.rank_diag_interval = args.rank_diag_interval
     CORE_DIAG_PLOT_ROLE = args.core_diag_role
     if args.batches:
         batches = args.batches
@@ -2203,6 +2637,7 @@ def main():
     summaries: List[dict] = []
     core_all: List[dict] = []
     core_dist_all: List[dict] = []
+    traces: List[Tuple[dict, dict]] = []
     if train:
         train = decorate_train(train)
         train.sort(key=lambda r: (r["kind"] != "dense", r["family"],
@@ -2220,6 +2655,23 @@ def main():
         if core_dist_all:
             write_csv(os.path.join(TABLES_DIR, "core_dist.csv"), core_dist_all,
                       CORE_DIST_COLUMNS)
+
+        rank_steps_all: List[dict] = []
+        rank_lambda_all: List[dict] = []
+        for r in train:
+            trace = load_rank_trace(r)
+            if trace is None:
+                continue
+            traces.append((r, trace))
+            steps, bonds = rank_trace_rows(r, trace)
+            rank_steps_all.extend(steps)
+            rank_lambda_all.extend(bonds)
+        if rank_steps_all:
+            write_csv(os.path.join(TABLES_DIR, "rank_steps.csv"),
+                      rank_steps_all, RANK_STEP_COLUMNS)
+        if rank_lambda_all:
+            write_csv(os.path.join(TABLES_DIR, "rank_lambda.csv"),
+                      rank_lambda_all, RANK_LAMBDA_COLUMNS)
 
         for r in train:
             if r["kind"] != "adaptive":
@@ -2264,6 +2716,8 @@ def main():
         plot_memory(bench, train, batches)
         plot_ranks(summaries, rank_all)
         plot_core_diag(core_all, core_dist_all)
+        for r, trace in traces:
+            plot_rank_trace(r, trace)
     except Exception as e:
         print(f"plotting failed: {type(e).__name__}: {e}")
 

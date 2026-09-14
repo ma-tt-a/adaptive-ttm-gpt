@@ -2,5 +2,6 @@ results*/
 data/
 __pycache__/
 .venv/
+tmp/
 *.pyc
 CLAUDE.md

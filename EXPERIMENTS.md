@@ -166,7 +166,7 @@ at val 3.90 and 3.88 (same batch, different sampling), with peak memory 7.5 MB a
 
 `--grad-accum 1` is bit-identical to the pre-accumulation loop and is left out of the cache key, so
 existing cached arms stay valid; any other value is part of the key.
-| `--log-interval N` | `500` (smoke `25`) | iterations between printed progress lines. Losses are still recorded every 100 iterations for the plots. |
+| `--log-interval N` | `500` (smoke `25`) | iterations between progress lines. They go to `tmp/<session>/train_<arm>_<mode>_<hash>.txt` (flushed per line, `tail -f` it), not stdout; the file header carries the arm config, dataset/subset and the token budget. Losses are still recorded every 100 iterations for the plots. |
 
 ### Phase 5 — core diagnostics
 
@@ -175,10 +175,11 @@ Sampled during training, so these flags only affect arms that are actually (re)c
 | flag | default | what it does |
 |---|---|---|
 | `--core-diag-interval N` | `100` (smoke `10`) | iterations between core snapshots; `0` disables. Deliberately **not** part of the cache key — retuning the diagnostics would otherwise invalidate hours of cached training. A cached arm therefore keeps whatever diagnostics it was trained with; `--force` resamples it. |
+| `--rank-diag-interval N` | `100` (smoke `10`) | adaptive arms: iterations between full snapshots of every lambda and its gradient; `0` keeps only the per-step counts. Not part of the cache key. |
 | `--core-diag-role c_attn\|attn_proj\|c_fc\|mlp_proj` | `c_fc` | which role the per-arm figure draws. Every probed role is written to `core_stats.csv` regardless; only the plot is narrowed, because a panel with 4 roles x 2d cores is unreadable. |
 
-What is probed: every TT role in the **first, middle and last** block (`{0, n_layer//2, n_layer-1}`),
-every core of those layers. Two tables come out of each snapshot:
+What is probed: every TT role in **every** block, every core of those layers (the figure still draws
+only the first, middle and last block). Two tables come out of each snapshot:
 
 - **per core** (`core_stats.csv`) — `mean`, `std`, `absmax`, `norm`, the gradient norm of that step,
   and, in adaptive arms, the mean/min of the rank parameter gating its trailing bond plus how many of
@@ -190,6 +191,19 @@ every core of those layers. Two tables come out of each snapshot:
 
 The whole snapshot is one `cat` + one `.tolist()`, i.e. a single device synchronize, so it does not
 leak into the step-time medians.
+
+**Rank parameters** (`RankTracer`, adaptive arms only), read after the last backward and *before*
+gradient clipping, saved to `results/runs/<run>.rank.pt`:
+
+- every step: alive count per bond, their total `N` (the denominator of `rank_loss`, so `gamma / N`
+  is the coefficient of the rank gradient) and the pre-clip global gradient norm -> `rank_steps.csv`;
+- every `--rank-diag-interval`: every `lambda_i`, its total gradient, and the task part of it. The
+  rank-loss part is `gamma / N` on alive entries in closed form, so the task part is the difference
+  (checked against a separate task-only backward to 5e-10) -> full values in the `.rank.pt`
+  (`snaps[k] = [lambda, grad, task_grad]`), per-bond summaries in `rank_lambda.csv`, where
+  `down_frac` is the fraction of alive lambdas whose total gradient pushes them down.
+
+Per-step tensors stay on device and are read back once per `eval_interval`.
 
 ## Tracking a run live
 
@@ -280,10 +294,12 @@ be mistaken for a full one.
 | file | contents |
 |---|---|
 | `tables/bench.csv` | per configuration and batch: fwd/bwd step time, projected minutes per epoch, peak memory (inference / fwd+bwd / fwd+bwd+AdamW step), optimizer-state size, compile diagnostics |
-| `tables/train.csv` | per arm: effective params, compression, val loss/ppl, step time, memory |
+| `tables/train.csv` | per arm: effective params, compression, val loss/ppl, step time, memory, dataset/subset, iterations, tokens per arm, epochs |
 | `tables/ranks.csv` | one row per arm x TT layer x bond: initial and final rank |
 | `tables/rank_summary.csv` | per adaptive arm: `pruned_frac`, mean/min/max rank, dead bonds |
 | `tables/core_stats.csv` | one row per arm x snapshot x TT layer x core: mean/std/absmax/norm, gradient norm, rank-parameter state |
+| `tables/rank_steps.csv` | adaptive arms, one row per step: `n_alive`, `coef = gamma / N`, pre-clip grad norm |
+| `tables/rank_lambda.csv` | adaptive arms, one row per snapshot x bond: alive, lambda min/mean/max, total and task gradient, `down_frac` |
 | `tables/core_dist.csv` | one row per arm x snapshot x TT layer x core group: percentiles of the core entries |
 | `tables/memory.csv` | static footprint next to the measured peaks |
 | `plots/1_epoch_{forward,backward}.png`, `2_epoch_total.png` | the CoMERA bar chart |
@@ -293,6 +309,7 @@ be mistaken for a full one.
 | `plots/5_rank_pruned_frac.png`, `5c_rank_heatmap.png`, `5d_rank_by_role.png` | final rank configuration |
 | `plots/5e_rank_kept_frac.png` | same layer x bond grid as `5c`, but `kept_frac` instead of the absolute rank. Read this one to judge pruning: the chain ends never start at `max_rank` (`get_uniform_rank` clips them by the mode products), so on the absolute map every arm looks pruned at the edges when nothing was pruned there. |
 | `plots/6_cores_<arm>.png` | one figure per arm, one row per probed block: three percentile-band panels for the core values (left half of the chain, the two centre cores, right half), then the per-core gradient norm and rank-parameter mean (log axes wherever the quantity stays positive) |
+| `plots/6b_ranks_<arm>.png` | adaptive arms: `N` and `gamma / N` per step, kept fraction per block, mean task gradient against `gamma / N`, fraction of alive lambdas pushed down |
 | `plots/7_mem_static.png`, `8_mem_peak_{inference,backward}.png`, `8b_mem_peak_step.png` | memory footprint. `8b` is the one to read for training: it includes the AdamW states, i.e. the half of the tensorized saving a fwd+bwd measurement never sees. `8_mem_peak_inference.png` is the deployment-side number instead — no states, no gradients |
 
 ## Reading the warnings
