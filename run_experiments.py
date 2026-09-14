@@ -1271,9 +1271,15 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
     model.train()
     bar = tqdm(range(cfg.max_iters), desc=f"{arm.name}/{MODE_TAG[mode]}",
                leave=False, disable=BAR_DISABLE)
-    last_logged = 0  # iteration-based spacing, so the cadence is exactly
-    # log_interval regardless of how eval_interval divides into it
+    last_eval = None  # (iter, train, val) of the latest estimate_loss
+    t_loop = time.perf_counter()  # wall clock for the ETA: evals included
     for it in bar:
+        # the progress line runs on its own cadence, not eval_interval's: it
+        # used to sit inside the eval block, which rounded every
+        # --log-interval up to a multiple of eval_interval
+        log_due = ((it + 1) % max(1, cfg.log_interval) == 0
+                   or it == cfg.max_iters - 1)
+        step_loss = None
         mult = lr_multiplier(it, cfg)
         for g, base in zip(opt.param_groups, base_lrs):
             g["lr"] = base * mult
@@ -1285,6 +1291,9 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
                 X, Y = ds.get_batch("train", cfg.batch_size, cfg.block_size,
                                     device, generator=gen)
                 _, model_loss = model(X, Y)
+                if log_due:   # summed on device, read once per line
+                    part = model_loss.detach() / cfg.grad_accum
+                    step_loss = part if step_loss is None else step_loss + part
                 # mean over the micro-batches, so the gradient is the one the
                 # full batch would have produced
                 loss = model_loss / cfg.grad_accum
@@ -1351,22 +1360,30 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
                                  if step_times else float("nan"))}, it)
             bar.set_postfix(val=f"{losses['val']:.3f}",
                             eff=f"{history['eff_params'][-1]/1e3:.0f}k")
-            first = (it == 0 and cfg.max_iters > 1)
-            due = (it - last_logged) >= cfg.log_interval
-            if not first and (due or it == cfg.max_iters - 1):
-                last_logged = it
-                ms = median(step_times) * 1e3 if step_times else float("nan")
-                line = (f"it {it+1}/{cfg.max_iters}"
-                        f"  tok {human_tokens((it + 1) * cfg.tokens_per_step)}"
-                        f"/{human_tokens(cfg.tokens_per_step * cfg.max_iters)}"
-                        f"  train {losses['train']:.4f}"
-                        f"  val {losses['val']:.4f}"
-                        f"  eff {history['eff_params'][-1]/1e3:.0f}k"
-                        f"  {ms:.1f} ms/it")
-                if log:
-                    log.write(line)
-                else:
-                    tqdm.write(f"    {arm.name}/{MODE_TAG[mode]} {line}")
+            last_eval = (it, losses["train"], losses["val"])
+
+        if log_due:
+            ms = median(step_times) * 1e3 if step_times else float("nan")
+            # the tqdm bar itself -- percent, [elapsed<remaining, it/s] --
+            # since the live bar is disabled and the ETA is what the file is
+            # for
+            meter = tqdm.format_meter(it + 1, cfg.max_iters,
+                                      time.perf_counter() - t_loop,
+                                      ascii=True)
+            line = (f"{meter}"
+                    f"  tok {human_tokens((it + 1) * cfg.tokens_per_step)}"
+                    f"/{human_tokens(cfg.tokens_per_step * cfg.max_iters)}"
+                    f"  loss {float(step_loss):.4f}")
+            if last_eval is not None:
+                e_it, e_train, e_val = last_eval
+                line += (f"  eval@{e_it+1} train {e_train:.4f}"
+                         f" val {e_val:.4f}")
+            line += (f"  eff {history['eff_params'][-1]/1e3:.0f}k"
+                     f"  {ms:.1f} ms/it")
+            if log:
+                log.write(line)
+            else:
+                tqdm.write(f"    {arm.name}/{MODE_TAG[mode]} {line}")
     bar.close()
 
     mem = peak_memory(device) - mem_base + param_bytes
