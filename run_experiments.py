@@ -1114,11 +1114,17 @@ def load_rank_trace(rec: dict) -> Optional[dict]:
     return t.load(path, weights_only=True)
 
 
-def rank_trace_rows(rec: dict, trace: dict) -> Tuple[List[dict], List[dict]]:
+def rank_trace_rows(rec: dict,
+                    trace: dict) -> Tuple[List[dict], List[dict], List[dict]]:
     """
     rank_steps.csv: one row per step. rank_lambda.csv: one row per snapshot x
     bond, lambdas and gradients summarized -- the individual values stay in the
-    .rank.pt, since at gpt2-small they are ~8k per snapshot.
+    .rank.pt, since at gpt2-small they are ~8k per snapshot. rank_dist.csv:
+    percentiles of lambda per snapshot x layer x bond group, the core_dist
+    scheme applied to the lambdas gating each core group's trailing bonds.
+
+    Derived from the sidecar only, so an arm traced before these columns
+    existed gets them on re-plot.
     """
     gamma = trace["gamma"]
     tag = {"arm": rec["arm"], "family": rec["family"]}
@@ -1132,7 +1138,13 @@ def rank_trace_rows(rec: dict, trace: dict) -> Tuple[List[dict], List[dict]]:
     sizes = [size for _, _, size in trace["layout"]]
     n_at = dict(zip(step_iter, n_alive))
     tol = trace["threshold"].split(sizes)
-    bonds = []
+    q = t.tensor(CORE_DIAG_QUANTILES)
+    labels = [PCT_LABEL % int(p * 100) for p in CORE_DIAG_QUANTILES]
+    layer_bonds: Dict[str, List[int]] = {}
+    for j, (name, _, _) in enumerate(trace["layout"]):
+        layer_bonds.setdefault(name, []).append(j)
+
+    bonds, dist = [], []
     for k, it in enumerate(trace["snap_iter"].tolist()):
         coef = gamma / max(n_at[it], 1)
         lam, grad, task = (v.split(sizes) for v in trace["snaps"][k])
@@ -1140,17 +1152,41 @@ def rank_trace_rows(rec: dict, trace: dict) -> Tuple[List[dict], List[dict]]:
             block, role = parse_layer_name(name)
             live = lam[j] > tol[j]
             alive = int(live.sum())
-            bonds.append(dict(
+            row = dict(
                 tag, iter=it, layer=name, block=block, role=role, bond=bond,
-                size=size, alive=alive, coef=coef,
+                size=size, alive=alive, coef=coef, tol=float(tol[j][0]),
                 lam_mean=float(lam[j].mean()), lam_min=float(lam[j].min()),
                 lam_max=float(lam[j].max()), grad_mean=float(grad[j].mean()),
+                grad_norm=float(grad[j].norm()),
                 task_grad_mean=float(task[j].mean()),
                 task_grad_min=float(task[j].min()),
                 task_grad_max=float(task[j].max()),
+                task_grad_norm=float(task[j].norm()),
                 down_frac=(float((grad[j][live] > 0).float().mean())
-                           if alive else float("nan"))))
-    return steps, bonds
+                           if alive else float("nan")))
+            row.update(zip(["lam_" + l for l in labels],
+                           t.quantile(lam[j].float(), q).tolist()))
+            bonds.append(row)
+
+        # bond n trails core n, so core_groups' split maps onto the bonds as
+        # left = cores[:d] -> bonds[:d], centre = cores[d-1:d+1] ->
+        # bonds[d-1:d+1], right = cores[d:] -> bonds[d:] (the last core has none)
+        for name, js in layer_bonds.items():
+            block, role = parse_layer_name(name)
+            d = (len(js) + 1) // 2
+            for gname, group in (("left", js[:d]), ("centre", js[d - 1:d + 1]),
+                                 ("right", js[d:])):
+                if not group:
+                    continue
+                x = t.cat([lam[j] for j in group]).float()
+                row = dict(tag, iter=it, layer=name, block=block, role=role,
+                           group=gname, size=x.numel(),
+                           alive=int(sum((lam[j] > tol[j]).sum()
+                                         for j in group)),
+                           tol=float(tol[group[0]][0]))
+                row.update(zip(labels, t.quantile(x, q).tolist()))
+                dist.append(row)
+    return steps, bonds, dist
 
 
 def plot_rank_trace(rec: dict, trace: dict):
@@ -1162,8 +1198,8 @@ def plot_rank_trace(rec: dict, trace: dict):
     if not len(trace["step_iter"]):
         return
     plt = _plt()
-    steps, bonds = rank_trace_rows(rec, trace)
-    xs = [r["iter"] for r in steps]
+    steps, bonds, _ = rank_trace_rows(rec, trace)
+    xs =[r["iter"] for r in steps]
     layer_block = [parse_layer_name(n)[0] for n, _, _ in trace["layout"]]
     blocks = sorted(set(layer_block))
     cmap = plt.get_cmap("viridis")
@@ -1259,7 +1295,7 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
                                **data_info(cfg, ds)})
 
     history = {"iter": [], "train": [], "val": [], "eff_params": [],
-               "eff_size": [], "rank_loss": []}
+               "eff_size": [], "rank_loss": [], "n_alive": []}
     probed = diag_layers(raw_model, cfg) if cfg.core_diag_interval else []
     core_diag: List[dict] = []
     core_dist: List[dict] = []
@@ -1345,6 +1381,9 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
             history["eff_params"].append(comera.effective_params(raw_model))
             history["eff_size"].append(comera.model_size(raw_model))
             history["rank_loss"].append(rl)
+            # N at the eval steps; the per-step series is in the .rank.pt
+            history["n_alive"].append(int(comera.alive_count(raw_model))
+                                      if arm.adaptive else None)
             # perplexity alongside the loss: it is the number the run is
             # actually judged on, and exp() of a diverged loss overflows the
             # chart, so it is clamped the same way the final metric is
@@ -1805,10 +1844,17 @@ CORE_FMT = {"mean": ".3e", "std": ".3e", "absmax": ".3e", "norm": ".3e",
             "rank_alive": ".0f"}
 
 RANK_STEP_COLUMNS = ["arm", "family", "iter", "n_alive", "coef", "grad_norm"]
-RANK_LAMBDA_COLUMNS = ["arm", "family", "iter", "layer", "block", "role",
-                       "bond", "size", "alive", "coef", "lam_mean", "lam_min",
-                       "lam_max", "grad_mean", "task_grad_mean",
-                       "task_grad_min", "task_grad_max", "down_frac"]
+RANK_LAMBDA_COLUMNS = (["arm", "family", "iter", "layer", "block", "role",
+                       "bond", "size", "alive", "coef", "tol", "lam_mean",
+                       "lam_min", "lam_max"]
+                       + ["lam_" + PCT_LABEL % int(q * 100)
+                          for q in CORE_DIAG_QUANTILES]
+                       + ["grad_mean", "grad_norm", "task_grad_mean",
+                          "task_grad_min", "task_grad_max", "task_grad_norm",
+                          "down_frac"])
+RANK_DIST_COLUMNS = (["arm", "family", "iter", "layer", "block", "role",
+                      "group", "size", "alive", "tol"]
+                     + [PCT_LABEL % int(q * 100) for q in CORE_DIAG_QUANTILES])
 
 CORE_DIST_COLUMNS = (["arm", "family", "iter", "layer", "block", "role",
                       "group"]
@@ -2702,20 +2748,25 @@ def main():
 
         rank_steps_all: List[dict] = []
         rank_lambda_all: List[dict] = []
+        rank_dist_all: List[dict] = []
         for r in train:
             trace = load_rank_trace(r)
             if trace is None:
                 continue
             traces.append((r, trace))
-            steps, bonds = rank_trace_rows(r, trace)
+            steps, bonds, rdist = rank_trace_rows(r, trace)
             rank_steps_all.extend(steps)
             rank_lambda_all.extend(bonds)
+            rank_dist_all.extend(rdist)
         if rank_steps_all:
             write_csv(os.path.join(TABLES_DIR, "rank_steps.csv"),
                       rank_steps_all, RANK_STEP_COLUMNS)
         if rank_lambda_all:
             write_csv(os.path.join(TABLES_DIR, "rank_lambda.csv"),
                       rank_lambda_all, RANK_LAMBDA_COLUMNS)
+        if rank_dist_all:
+            write_csv(os.path.join(TABLES_DIR, "rank_dist.csv"),
+                      rank_dist_all, RANK_DIST_COLUMNS)
 
         for r in train:
             if r["kind"] != "adaptive":

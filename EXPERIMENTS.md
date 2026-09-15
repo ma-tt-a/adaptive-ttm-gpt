@@ -299,7 +299,8 @@ be mistaken for a full one.
 | `tables/rank_summary.csv` | per adaptive arm: `pruned_frac`, mean/min/max rank, dead bonds |
 | `tables/core_stats.csv` | one row per arm x snapshot x TT layer x core: mean/std/absmax/norm, gradient norm, rank-parameter state |
 | `tables/rank_steps.csv` | adaptive arms, one row per step: `n_alive`, `coef = gamma / N`, pre-clip grad norm |
-| `tables/rank_lambda.csv` | adaptive arms, one row per snapshot x bond: alive, lambda min/mean/max, total and task gradient, `down_frac` |
+| `tables/rank_lambda.csv` | adaptive arms, one row per snapshot x bond: alive, `tol`, lambda min/mean/max and p1/p25/p50/p75/p99, total and task gradient (mean/min/max/norm), `down_frac` |
+| `tables/rank_dist.csv` | adaptive arms, one row per snapshot x layer x bond group (left/centre/right, as `core_dist.csv`): alive, `tol`, lambda p1/p25/p50/p75/p99 |
 | `tables/core_dist.csv` | one row per arm x snapshot x TT layer x core group: percentiles of the core entries |
 | `tables/memory.csv` | static footprint next to the measured peaks |
 | `plots/1_epoch_{forward,backward}.png`, `2_epoch_total.png` | the CoMERA bar chart |

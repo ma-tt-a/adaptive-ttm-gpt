@@ -49,6 +49,16 @@ def rank_loss(model) -> t.Tensor:
     return loss / count.clamp(min=1)
 
 
+def alive_count(model) -> t.Tensor:
+    """
+    N = #{x > tol} over every rank parameter, the denominator of rank_loss
+    """
+    count = t.zeros((), dtype=t.long, device=next(model.parameters()).device)
+    for tol, params in _rank_groups(model):
+        count = count + t.sum(t.cat([p.reshape(-1) for p in params]) > tol)
+    return count
+
+
 def comera_loss(model_loss: t.Tensor, model, gamma: float = GAMMA) -> t.Tensor:
     """
     Early-stage CoMERA objective: task loss + gamma * rank loss
