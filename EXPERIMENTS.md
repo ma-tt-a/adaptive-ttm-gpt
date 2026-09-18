@@ -145,6 +145,7 @@ memory numbers were measured under an older protocol instead of mixing them with
 | `--arms NAME ...` | all | subset of arm names, e.g. `--arms dense uniform-r16 adaptive-r16-lr0.01`. |
 | `--train-compile-mode eager\|compile\|cudagraph` | `compile` (smoke `eager`) | how the tensorized arms are compiled. **dense always trains eager.** `cudagraph` is not the default: CUDA Graphs replay a captured graph whose parameters AdamW mutates outside it, which inductor skips silently — phase 1 is where the graph win is measured. |
 | `--iters N` | `1500` (smoke `50`) | training iterations per arm — i.e. optimizer steps, each of which now consumes `--grad-accum` micro-batches. |
+| `--seed N` | `42` | init and batch-stream seed; part of the cache key, so each seed is its own set of arms. |
 | `--micro-batch N` | `32` (smoke `8`) | sequences per forward. This is what activation memory scales with. |
 | `--grad-accum N` | `1` | forward/backward passes accumulated before each optimizer step. |
 

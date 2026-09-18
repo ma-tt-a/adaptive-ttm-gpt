@@ -2581,6 +2581,9 @@ def main():
                     help="linear warmup iterations before the cosine decay "
                          "(default 100, 5 under --smoke)")
     ap.add_argument("--iters", type=int, default=None)
+    ap.add_argument("--seed", type=int, default=None,
+                    help="init and batch-stream seed (default 42). Part of the "
+                         "cache key, so a second seed trains fresh arms")
     ap.add_argument("--micro-batch", type=int, default=None,
                     help="sequences per forward (default 32, smoke 8). This "
                          "is what activation memory scales with")
@@ -2674,6 +2677,8 @@ def main():
         cfg.warmup_iters = args.warmup
     if args.iters is not None:
         cfg.max_iters = args.iters
+    if args.seed is not None:
+        cfg.seed = args.seed
     if args.log_interval is not None:
         cfg.log_interval = args.log_interval
     if args.micro_batch is not None:
