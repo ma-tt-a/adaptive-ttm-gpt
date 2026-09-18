@@ -3,7 +3,7 @@ nanoGPT-style model with dense and TT-tensorized modes.
 
 Mirrors https://github.com/karpathy/nanoGPT/blob/master/model.py; the only
 structural change is that the four linears inside each block are built by
-_linear, which returns either nn.Linear or TTLinear.
+_linear, which returns nn.Linear, TTLinear or TTMLinear.
 """
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -12,9 +12,10 @@ import torch as t
 import torch.nn as nn
 import torch.nn.functional as F
 
-from tensorized_layers import TTLinear, TTLinearConfig
+from tensorized_layers import (TensorizedLinear, TTLinear, TTLinearConfig,
+                                TTMLinear, TTMLinearConfig)
 
-# per-role TT factorizations for n_embd = 256; d = 3, so 6 cores
+# per-role factorizations for n_embd = 256; d = 3, so 6 TT cores or 3 TTM cores
 TT_SHAPES_256 = {
     "c_attn": (t.Size([4, 8, 8]), t.Size([8, 8, 12])),    # 256 -> 768
     "attn_proj": (t.Size([4, 8, 8]), t.Size([4, 8, 8])),  # 256 -> 256
@@ -39,6 +40,11 @@ TT_SHAPES_768 = {
 }
 
 TT_SHAPES = {768: TT_SHAPES_768, 256: TT_SHAPES_256, 64: TT_SHAPES_64}
+
+# the same factorizations serve both formats: TT chains the in and out modes,
+# TTM pairs them core by core
+TT_FORMATS = {"tt": (TTLinear, TTLinearConfig),
+              "ttm": (TTMLinear, TTMLinearConfig)}
 
 # named model sizes. The values are exactly the fields TrainConfig carries, so
 # a preset is applied by setattr and nothing else knows about it. "base" is the
@@ -65,6 +71,7 @@ class GPTConfig:
     init_std: float = 2e-2
     # tensorization
     tensorized: bool = False
+    tt_format: str = "tt"   # tt | ttm
     max_rank: int = 30
     adaptive: bool = False
     threshold: float = 1e-2
@@ -79,7 +86,7 @@ class GPTConfig:
 
 def _linear(cfg: GPTConfig, in_f: int, out_f: int, role: str) -> nn.Module:
     """
-    TTLinear when the model is tensorized, otherwise a plain nn.Linear
+    TTLinear / TTMLinear when the model is tensorized, otherwise nn.Linear
     """
     if not cfg.tensorized:
         layer = nn.Linear(in_f, out_f, bias=cfg.bias)
@@ -92,14 +99,15 @@ def _linear(cfg: GPTConfig, in_f: int, out_f: int, role: str) -> nn.Module:
     assert in_shape.numel() == in_f and out_shape.numel() == out_f, \
         f"{role}: TT shapes {tuple(in_shape)}->{tuple(out_shape)} " \
         f"do not match {in_f}->{out_f}"
-    tt_cfg = TTLinearConfig.from_max_rank(
+    layer_cls, cfg_cls = TT_FORMATS[cfg.tt_format]
+    tt_cfg = cfg_cls.from_max_rank(
         in_shape, out_shape, cfg.max_rank,
         adaptive=cfg.adaptive,
         bias=cfg.bias,
         threshold=cfg.threshold,
         init_std=cfg.init_std,
     )
-    return TTLinear(tt_cfg)
+    return layer_cls(tt_cfg)
 
 
 class CausalSelfAttention(nn.Module):
@@ -172,8 +180,8 @@ class GPT(nn.Module):
         nn.init.normal_(self.transformer.wpe.weight,
                         mean=0.0, std=cfg.init_std)
 
-    def tt_layers(self) -> List[TTLinear]:
-        return [m for m in self.modules() if isinstance(m, TTLinear)]
+    def tt_layers(self) -> List[TensorizedLinear]:
+        return [m for m in self.modules() if isinstance(m, TensorizedLinear)]
 
     def num_params(self, non_embedding: bool = True) -> int:
         n = sum(p.numel() for p in self.parameters())

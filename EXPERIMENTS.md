@@ -101,9 +101,9 @@ choice, and `--data-tokens` is cheaper than an extra epoch.
 |---|---|---|
 | `--batches 1 8 32 64 128` | `1 8 32 64 128` (smoke `8 16`) | batch sizes on the x axis of the epoch-time, step-time and peak-memory plots. The small batches are the interesting ones for compile: by batch 128 the matmuls amortise the launch overhead on their own and every mode converges. |
 | `--compile-modes eager compile cudagraph` | all three | which of the three modes to measure. `compile` is inductor fusion, `cudagraph` is fusion + CUDA Graphs (a no-op on xpu). |
-| `--bench-rank N` | `32` | `max_rank` of the tensorized model being benchmarked. |
+| `--bench-rank N` | `32` | `max_rank` of the tensorized models being benchmarked (tt and ttm alike; at the same rank a ttm model is ~3x the tt one). |
 | `--bench-reps N` | `30` (smoke `5`) | timed forward/backward repetitions per cell, after 5 warmup steps (2 in smoke). |
-| `--kinds dense tensorized` | both | which models phase 1 may **compute**. The other kind is still read from the cache, so the plots keep both series either way — `--kinds dense` then `--kinds tensorized`, in two invocations, gives each model a process of its own. That is the only way to a memory number nothing else is holding: dynamo caches and CUDA-Graph pools do not survive an exit, whatever they survive inside one run. |
+| `--kinds dense tensorized ttm` | all three | `tensorized` is the TT model (`TTLinear`), `ttm` the TTM one (`TTMLinear`). Which models phase 1 may **compute**. The other kind is still read from the cache, so the plots keep both series either way — `--kinds dense` then `--kinds tensorized`, in two invocations, gives each model a process of its own. That is the only way to a memory number nothing else is holding: dynamo caches and CUDA-Graph pools do not survive an exit, whatever they survive inside one run. |
 
 The memory pass of a bench cell measures **three scenarios**, kept separate from the timing pass
 (which stays forward/backward only — that is the CoMERA figure). Each peak is an absolute
@@ -138,6 +138,8 @@ memory numbers were measured under an older protocol instead of mixing them with
 | flag | default | what it does |
 |---|---|---|
 | `--ranks 4 8 16 32` | `4 8 16 32` (smoke `4 8`) | the rank ladder. One `uniform-r<R>` arm and one adaptive arm per `lr_rank` for each entry. |
+| `--formats tt ttm` | both | which tensorized formats get the uniform + adaptive families. ttm arms are named `ttm-uniform-r<R>` / `ttm-adaptive-r<R>-lr<L>` and their families `ttm uniform` / `ttm adaptive lr=<L>`; tt arms keep their old names and cache keys. |
+| `--ttm-ranks R ...` | `--ranks` | a separate rank ladder for the ttm arms. |
 | `--lr-ranks 3e-3 1e-2` | `3e-3 1e-2` | learning rates for the rank parameters; each value becomes its own adaptive family, i.e. its own Pareto curve. Larger = more aggressive pruning. |
 | `--gamma G` | `0.1` (`comera.GAMMA`) | weight of the rank loss in `comera_loss`. Held fixed across arms so `lr_rank` is the only pruning-aggressiveness axis. |
 | `--arms NAME ...` | all | subset of arm names, e.g. `--arms dense uniform-r16 adaptive-r16-lr0.01`. |

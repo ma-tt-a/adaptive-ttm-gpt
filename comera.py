@@ -8,13 +8,16 @@ import weakref
 from typing import Dict, List
 import torch as t
 import torch.nn.functional as F
-from tensorized_layers import TTLinear
+from tensorized_layers import TensorizedLinear
 
 
 LR_TENSOR = 1e-4
 LR_ORIGIN = 5e-5
 LR_RANK = 1e-2
 GAMMA = 1e-1
+# rank_loss denominator: "total" (the constant M) replaced CoMERA's #alive.
+# Part of the adaptive arms' cache key in run_experiments
+RANK_LOSS = "total"
 
 _RANK_CACHE: "weakref.WeakKeyDictionary[t.nn.Module, list]" = (
     weakref.WeakKeyDictionary())
@@ -27,7 +30,7 @@ def _rank_groups(model) -> list:
     if model not in _RANK_CACHE:
         groups: Dict[float, list] = {}
         for m in model.modules():
-            if isinstance(m, TTLinear) and m.rank_params is not None:
+            if isinstance(m, TensorizedLinear) and m.rank_params is not None:
                 groups.setdefault(m.cfg.threshold, []).extend(m.rank_params)
         _RANK_CACHE[model] = list(groups.items())
     return _RANK_CACHE[model]
@@ -35,7 +38,13 @@ def _rank_groups(model) -> list:
 
 def rank_loss(model) -> t.Tensor:
     """
-    sum(threshold(x, tol, 0)) / #{x > tol} over every rank parameter.
+    sum(threshold(x, tol, 0)) / M over every rank parameter, M = their total
+    count.
+
+    CoMERA divides by #{x > tol} instead. That denominator shrinks as ranks
+    die, so the pressure gamma / N on each survivor grows with every death --
+    a cascade that ends with whole layers pruned to rank 0. M is a constant,
+    so the per-entry pressure is gamma / M throughout.
     """
     groups = _rank_groups(model)
     if not groups:
@@ -44,14 +53,21 @@ def rank_loss(model) -> t.Tensor:
     loss, count = 0.0, 0
     for tol, params in groups:
         x = t.cat([p.reshape(-1) for p in params])
-        count = count + t.sum(x > tol)
+        count += x.numel()
         loss = loss + t.sum(F.threshold(x, tol, 0))
-    return loss / count.clamp(min=1)
+    return loss / count
+
+
+def rank_total(model) -> int:
+    """
+    M, the constant denominator of rank_loss
+    """
+    return sum(p.numel() for _, params in _rank_groups(model) for p in params)
 
 
 def alive_count(model) -> t.Tensor:
     """
-    N = #{x > tol} over every rank parameter, the denominator of rank_loss
+    N = #{x > tol} over every rank parameter
     """
     count = t.zeros((), dtype=t.long, device=next(model.parameters()).device)
     for tol, params in _rank_groups(model):
@@ -73,7 +89,7 @@ def model_size(model) -> int:
     # core parameters implied by the surviving ranks
     """
     return sum(m.effective_size() for m in model.modules()
-               if isinstance(m, TTLinear))
+               if isinstance(m, TensorizedLinear))
 
 
 def nominal_size(model) -> int:
@@ -81,7 +97,7 @@ def nominal_size(model) -> int:
     # core parameters at full rank, i.e. what is actually allocated
     """
     return sum(p.numel() for m in model.modules()
-               if isinstance(m, TTLinear) for p in m.cores)
+               if isinstance(m, TensorizedLinear) for p in m.cores)
 
 
 def effective_params(model) -> int:
@@ -97,7 +113,7 @@ def rank_report(model) -> Dict[str, List[int]]:
     Surviving TT-ranks per TT layer, keyed by module name
     """
     return {name: m.effective_rank() for name, m in model.named_modules()
-            if isinstance(m, TTLinear)}
+            if isinstance(m, TensorizedLinear)}
 
 
 def param_groups(model, lr_tensor: float = LR_TENSOR,
@@ -108,7 +124,7 @@ def param_groups(model, lr_tensor: float = LR_TENSOR,
     rank_ids = set()
     core_ids = set()
     for m in model.modules():
-        if not isinstance(m, TTLinear):
+        if not isinstance(m, TensorizedLinear):
             continue
         core_ids.update(id(p) for p in m.cores)
         if m.rank_params is not None:

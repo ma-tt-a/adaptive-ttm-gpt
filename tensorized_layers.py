@@ -1,5 +1,7 @@
 from dataclasses import dataclass
-from utils import TTMatVec, build_cores_gauss, get_xavier_std, get_uniform_rank
+from utils import (TTMatVec, build_cores_gauss, build_ttm_cores_gauss,
+                   get_xavier_std, get_uniform_rank, get_uniform_ttm_rank,
+                   ttm_matvec)
 from typing import List
 import torch as t
 import torch.nn as nn
@@ -29,7 +31,34 @@ class TTLinearConfig:
         assert self.rank[0] == self.rank[-1] == 1, f"It is not TT format: R_0 != 1 or R_-1 != 1"
 
 
-class TTLinear(nn.Module):
+@dataclass
+class TTMLinearConfig(TTLinearConfig):
+    """
+    in_shape: I_1, ..., I_d; out_shape: J_1, ..., J_d; rank: 1, R_1, ..., R_d-1, 1
+    """
+
+    @classmethod
+    def from_max_rank(cls, in_shape: t.Size, out_shape: t.Size,
+                      max_rank: int, **kwargs):
+        rank = get_uniform_ttm_rank(in_shape, out_shape, max_rank)
+        return cls(in_shape=in_shape, out_shape=out_shape, rank=rank, **kwargs)
+
+    def __post_init__(self):
+        assert len(self.in_shape) == len(self.out_shape), \
+            "TTM needs as many in as out modes"
+        self.N = len(self.in_shape)
+        assert len(self.rank) == self.N + \
+            1, f"TTM-rank: expected={self.N + 1}, given={len(self.rank)}"
+        assert self.rank[0] == self.rank[-1] == 1, f"It is not TTM format: R_0 != 1 or R_-1 != 1"
+
+
+class TensorizedLinear(nn.Module):
+    """
+    What TTLinear and TTMLinear share: a chain of cores whose trailing rank
+    axis is the last one, and the CoMERA rank mask over the internal bonds.
+    Subclasses build the cores and contract them in forward.
+    """
+
     def __init__(self, cfg: TTLinearConfig):
         super().__init__()
         self.cfg = cfg
@@ -41,12 +70,7 @@ class TTLinear(nn.Module):
         self.bias = nn.Parameter(t.zeros(self.J)) if cfg.bias else None
 
     def _build_cores(self) -> List[nn.Parameter]:
-        rank = self.cfg.rank
-        shape = self.cfg.in_shape + self.cfg.out_shape
-        std = get_xavier_std(rank, self.cfg.init_std)
-        res = [nn.Parameter(core)
-               for core in build_cores_gauss(shape, rank, std)]
-        return res
+        raise NotImplementedError
 
     def _build_rank(self) -> List[nn.Parameter]:
         rank = self.cfg.rank
@@ -69,15 +93,14 @@ class TTLinear(nn.Module):
         res = []
         mask = self.get_rank_mask()
         for n in range(len(mask)):
-            D = mask[n][None, None, :]
-            G = self.cores[n]
-            res.append(G * D)
+            # the trailing rank axis is the last one for TT and TTM cores alike
+            res.append(self.cores[n] * mask[n])
         res.append(self.cores[-1])
         return res
 
     def effective_rank(self) -> List[int]:
         """
-        Surviving TT-ranks, i.e. rank entries above the threshold
+        Surviving ranks, i.e. rank entries above the threshold
         """
         if not self.cfg.adaptive:
             return list(self.cfg.rank[1:-1])
@@ -91,12 +114,55 @@ class TTLinear(nn.Module):
         R = [1] + self.effective_rank() + [1]
         if any(r == 0 for r in R):
             return 0
-        return sum(G.shape[1] * R[n] * R[n + 1]
+        return sum(G.shape[1:-1].numel() * R[n] * R[n + 1]
                    for n, G in enumerate(self.cores))
 
+    def matvec(self, X: t.Tensor, cores: List[t.Tensor]) -> t.Tensor:
+        """
+        (B, I) -> (B, J)
+        """
+        raise NotImplementedError
+
     def forward(self, X):
-        # TTMatVec is a matrix product: fold any leading dims into the batch
+        # fold any leading dims into the batch
         sh = X.shape
-        Y = TTMatVec.apply(X.reshape(-1, sh[-1]), *self.get_cores())
+        Y = self.matvec(X.reshape(-1, sh[-1]), self.get_cores())
         out = Y.reshape(sh[:-1] + (self.J,))
         return out + self.bias if self.cfg.bias else out
+
+
+class TTLinear(TensorizedLinear):
+    """
+    2d cores (R_n-1, mode_n, R_n): d input modes, then d output modes
+    """
+
+    def _build_cores(self) -> List[nn.Parameter]:
+        rank = self.cfg.rank
+        shape = self.cfg.in_shape + self.cfg.out_shape
+        std = get_xavier_std(rank, self.cfg.init_std)
+        res = [nn.Parameter(core)
+               for core in build_cores_gauss(shape, rank, std)]
+        return res
+
+    def matvec(self, X, cores):
+        return TTMatVec.apply(X, *cores)
+
+
+class TTMLinear(TensorizedLinear):
+    """
+    d cores (R_n-1, I_n, J_n, R_n): one input and one output mode per core
+    """
+
+    def _build_cores(self) -> List[nn.Parameter]:
+        cfg = self.cfg
+        # Var(W) = prod(rank) * std ** (2d) holds for TTM as for TT: an entry
+        # of W is still a sum over the internal ranks of a product of d entries
+        std = get_xavier_std(cfg.rank, cfg.init_std)
+        res = [nn.Parameter(core) for core in build_ttm_cores_gauss(
+            cfg.in_shape, cfg.out_shape, cfg.rank, std)]
+        return res
+
+    def matvec(self, X, cores):
+        Y = ttm_matvec(X.reshape((X.shape[0],) + tuple(self.cfg.in_shape)),
+                       *cores)
+        return Y.reshape(X.shape[0], self.J)

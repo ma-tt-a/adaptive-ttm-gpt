@@ -72,6 +72,59 @@ def get_uniform_rank(in_shape: t.Size, out_shape: t.Size, max_rank: int) -> t.Si
     return t.Size(rank)
 
 
+def get_uniform_ttm_rank(in_shape: t.Size, out_shape: t.Size,
+                         max_rank: int) -> t.Size:
+    """
+    Uniform TTM-rank: core n carries the mode pair (I_n, J_n), so the clipping
+    runs over the products I_n * J_n
+    """
+    assert len(in_shape) == len(out_shape), "TTM needs as many in as out modes"
+    dims = t.Size([i * j for i, j in zip(in_shape, out_shape)])
+    return get_uniform_rank(dims, t.Size([]), max_rank)
+
+
+def build_ttm_cores_gauss(in_shape: t.Size, out_shape: t.Size, rank: t.Size,
+                          std: float = 1.0):
+    """
+    TTM cores (R_n-1, I_n, J_n, R_n) from a centered normal
+    """
+    return [std * t.randn(rank[n], in_shape[n], out_shape[n], rank[n + 1])
+            for n in range(len(in_shape))]
+
+
+def ttm_matvec(X: t.Tensor, *cores: t.Tensor) -> t.Tensor:
+    """
+    X (B, I_1, ..., I_d) x TTM -> (B, J_1, ..., J_d) as one einsum.
+
+    torch.einsum picks the contraction order with opt_einsum when it is
+    installed, from the actual shapes: for a large batch the cheapest path
+    builds the dense matrix first, for a small one it threads X through the
+    cores. Autograd differentiates whatever path it chose.
+    """
+    d = len(cores)
+    # labels: 0 = batch, 1..d+1 = ranks, then d in modes, then d out modes
+    b, r, i, j = 0, 1, d + 2, 2 * d + 2
+    expr = [X, [b] + [i + n for n in range(d)]]
+    for n, G in enumerate(cores):
+        expr += [G, [r + n, i + n, j + n, r + n + 1]]
+    return t.einsum(*expr, [b] + [j + n for n in range(d)])
+
+
+def ttm_2_matrix(cores: List[t.Tensor]) -> t.Tensor:
+    """
+    Contract TTM cores into the dense I x J matrix
+    """
+    d = len(cores)
+    r, i, j = 0, d + 1, 2 * d + 1
+    expr = []
+    for n, G in enumerate(cores):
+        expr += [G, [r + n, i + n, j + n, r + n + 1]]
+    W = t.einsum(*expr, [r] + [i + n for n in range(d)] +
+                 [j + n for n in range(d)] + [r + d])
+    I = t.Size([G.shape[1] for G in cores]).numel()
+    return W.reshape(I, W.numel() // I)
+
+
 def get_device():
     """
     Pick the available accelerator: cuda (colab), xpu (local intel), else cpu

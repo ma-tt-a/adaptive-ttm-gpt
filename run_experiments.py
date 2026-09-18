@@ -57,8 +57,9 @@ import data
 import tracking
 from data import DATASETS, get_dataset, human_tokens
 from gpt import GPT, GPTConfig, MODEL_PRESETS, TT_SHAPES
-from tensorized_layers import TTLinear
-from utils import get_device, device_module, get_uniform_rank
+from tensorized_layers import TensorizedLinear
+from utils import (get_device, device_module, get_uniform_rank,
+                   get_uniform_ttm_rank)
 
 # tqdm disable flag: True = off (the default), False = on via --progress.
 # Off unconditionally rather than by tty detection: under `!python` colab pipes
@@ -103,7 +104,8 @@ def label_of(kind: str, mode: Optional[str]) -> str:
 # ============================================================================
 
 # phase 1
-BENCH_KINDS = ["dense", "tensorized"]
+# "tensorized" is the TT model (the name predates TTM and is in the cache keys)
+BENCH_KINDS = ["dense", "tensorized", "ttm"]
 BENCH_MODES = [None, "default", "reduce-overhead"]
 # batch 1 and 8 are where compile is actually interesting: at batch 128 the
 # matmuls are large enough to amortise the launch overhead on their own, so
@@ -133,7 +135,11 @@ ADAPTIVE_LRS = [3e-3, 1e-2]
 
 # colours, so a configuration keeps its colour across every plot
 KIND_COLORS = {"dense": ["#d62728", "#ff7f0e", "#8c564b"],
-               "tensorized": ["#2ca02c", "#1f77b4", "#17becf"]}
+               "tensorized": ["#2ca02c", "#1f77b4", "#17becf"],
+               "ttm": ["#9467bd", "#e377c2", "#bcbd22"]}
+
+# the tensorized formats a training arm can take, gpt.TT_FORMATS keys
+FORMATS = ["tt", "ttm"]
 
 
 @dataclass
@@ -144,6 +150,7 @@ class Arm:
     max_rank: int = BENCH_MAX_RANK
     gamma: float = 0.0
     lr_rank: float = comera.LR_RANK
+    fmt: str = "tt"    # tt | ttm, gpt.TT_FORMATS
 
     @property
     def kind(self) -> str:
@@ -158,19 +165,30 @@ class Arm:
         """
         if not self.tensorized:
             return "dense"
+        # tt families keep their pre-TTM names, so old records still plot
+        pre = "" if self.fmt == "tt" else f"{self.fmt} "
         if not self.adaptive:
-            return "uniform"
-        return f"adaptive lr={self.lr_rank:g}"
+            return pre + "uniform"
+        return pre + f"adaptive lr={self.lr_rank:g}"
 
 
 def build_arms(uniform_ranks: List[int], adaptive_ranks: List[int],
-               adaptive_lrs: List[float], gamma: float) -> List[Arm]:
+               adaptive_lrs: List[float], gamma: float,
+               formats: List[str] = ("tt",),
+               ttm_ranks: Optional[List[int]] = None) -> List[Arm]:
     arms = [Arm("dense")]
-    arms += [Arm(f"uniform-r{r}", tensorized=True, max_rank=r)
-             for r in uniform_ranks]
-    arms += [Arm(f"adaptive-r{r}-lr{lr:g}", tensorized=True, adaptive=True,
-                 max_rank=r, gamma=gamma, lr_rank=lr)
-             for lr in adaptive_lrs for r in adaptive_ranks]
+    for fmt in formats:
+        pre = "" if fmt == "tt" else f"{fmt}-"
+        u_ranks, a_ranks = uniform_ranks, adaptive_ranks
+        if fmt == "ttm" and ttm_ranks:
+            u_ranks = a_ranks = ttm_ranks
+        arms += [Arm(f"{pre}uniform-r{r}", tensorized=True, max_rank=r,
+                     fmt=fmt)
+                 for r in u_ranks]
+        arms += [Arm(f"{pre}adaptive-r{r}-lr{lr:g}", tensorized=True,
+                     adaptive=True, max_rank=r, gamma=gamma, lr_rank=lr,
+                     fmt=fmt)
+                 for lr in adaptive_lrs for r in a_ranks]
     return arms
 
 
@@ -443,7 +461,15 @@ def config_hash(arm: Arm, cfg: TrainConfig) -> str:
     # collide with it
     if cfg_d.get("grad_accum") == 1:
         cfg_d.pop("grad_accum")
-    return hash_payload(asdict(arm), cfg_d)
+    arm_d = asdict(arm)
+    # same trick for the arm: fmt="tt" is what every pre-TTM arm was
+    if arm_d["fmt"] == "tt":
+        arm_d.pop("fmt")
+    # the rank loss changed its denominator (#alive -> the constant total), so
+    # every adaptive arm trained under the old one is a different experiment
+    if arm.adaptive:
+        arm_d["rank_loss"] = comera.RANK_LOSS
+    return hash_payload(arm_d, cfg_d)
 
 
 def finite(v) -> bool:
@@ -521,6 +547,7 @@ def build_model(arm: Arm, cfg: TrainConfig, ds: data.Dataset,
         n_embd=cfg.n_embd,
         init_std=cfg.init_std,
         tensorized=arm.tensorized,
+        tt_format=arm.fmt,
         adaptive=arm.adaptive,
         max_rank=arm.max_rank,
     )
@@ -590,7 +617,8 @@ def bench_cell(kind: str, mode: Optional[str], batch: int, cfg: TrainConfig,
     # would fold into its baseline
     release_cell(device)
 
-    arm = Arm(kind, tensorized=(kind == "tensorized"), max_rank=max_rank)
+    arm = Arm(kind, tensorized=(kind != "dense"), max_rank=max_rank,
+              fmt="ttm" if kind == "ttm" else "tt")
     model = build_model(arm, cfg, ds, device)
     raw_model = model
     param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
@@ -702,7 +730,7 @@ def bench_cell(kind: str, mode: Optional[str], batch: int, cfg: TrainConfig,
         "label": label_of(kind, mode),
         "batch": batch,
         "block_size": cfg.block_size,
-        "max_rank": max_rank if kind == "tensorized" else None,
+        "max_rank": max_rank if kind != "dense" else None,
         "config_hash": hash_payload(kind, MODE_TAG[mode], batch, max_rank,
                                     cfg_fingerprint(cfg), reps, warmup,
                                     BENCH_PROTOCOL),
@@ -831,18 +859,19 @@ def core_groups(cores: List[t.Tensor]):
             ("right", cores[d:])]
 
 
-def diag_layers(model: GPT, cfg: TrainConfig) -> List[Tuple[str, TTLinear]]:
+def diag_layers(model: GPT,
+                cfg: TrainConfig) -> List[Tuple[str, TensorizedLinear]]:
     """
     The TT layers sampled during training: every role in every block. The
     figure narrows to CORE_DIAG_PLOT_BLOCKS; the csv keeps all of them, since a
     collapse confined to the last blocks is exactly what three probes can miss.
     """
     return [(name, m) for name, m in model.named_modules()
-            if isinstance(m, TTLinear)]
+            if isinstance(m, TensorizedLinear)]
 
 
 @t.no_grad()
-def core_snapshot(layers: List[Tuple[str, TTLinear]],
+def core_snapshot(layers: List[Tuple[str, TensorizedLinear]],
                   it: int) -> Tuple[List[dict], List[dict]]:
     """
     Two views of the same moment: one row per core (summary statistics, the
@@ -963,16 +992,15 @@ class RankTracer:
     Every lambda of every TT layer, laid out as one flat vector in module order.
 
     Two cadences:
-      - every step: alive count per bond, their total N (the denominator of
-        comera.rank_loss, so gamma / N is the coefficient of the rank-loss
-        gradient) and the pre-clip global gradient norm;
+      - every step: alive count per bond, their total N and the pre-clip
+        global gradient norm;
       - every rank_diag_interval: lambda itself, its total gradient, and the
         task part of that gradient.
 
     Both are read before clip_grad_norm_, i.e. they are the gradient of the
     loss, not what AdamW receives. The rank-loss part is known in closed form
-    -- d/dlambda_i [gamma * sum(threshold(x)) / N] = gamma / N on alive entries
-    (N is a count, it carries no gradient) -- so the task part is the
+    -- d/dlambda_i [gamma * sum(threshold(x)) / M] = gamma / M on alive entries,
+    M the constant total of comera.rank_loss -- so the task part is the
     difference and costs no second backward. A dead entry has zero gradient
     from both terms: F.threshold zeroes it, so only Adam's momentum moves it.
 
@@ -985,7 +1013,8 @@ class RankTracer:
         self.params: List[t.Tensor] = []
         tols, bonds = [], []
         for name, m in model.named_modules():
-            if not (isinstance(m, TTLinear) and m.rank_params is not None):
+            if not (isinstance(m, TensorizedLinear)
+                    and m.rank_params is not None):
                 continue
             for n, p in enumerate(m.rank_params):
                 tols.append(t.full((p.numel(),), m.cfg.threshold))
@@ -1003,6 +1032,7 @@ class RankTracer:
         self.nblock = int(self.block.max()) + 1
         self.block_size = t.zeros(self.nblock).index_add_(
             0, self.block, sizes.float())
+        self.coef = gamma / max(int(sizes.sum()), 1)   # gamma / M
         # flushed (cpu) and pending (device) halves of the same series
         self.steps: List[int] = []
         self.alive: List[t.Tensor] = []
@@ -1027,7 +1057,7 @@ class RankTracer:
             g = t.cat([(p.grad if p.grad is not None
                         else t.zeros_like(p)).reshape(-1)
                        for p in self.params])
-            g_rank = self.gamma / alive.sum().clamp(min=1) * live
+            g_rank = self.coef * live
             self._snap_iters.append(it)
             self._snaps.append(t.stack([x, g, g - g_rank]))
 
@@ -1060,7 +1090,7 @@ class RankTracer:
         tol = self.tol.cpu()
         for i, it in enumerate(steps):
             n = int(alive[i].sum())
-            out = {"rank/N": n, "rank/coef": self.gamma / max(n, 1),
+            out = {"rank/N": n, "rank/coef": self.coef,
                    "rank/grad_norm_preclip": float(norms[i])}
             out.update({f"rank/kept/block{b}": float(kept[i, b])
                         for b in range(self.nblock)})
@@ -1090,7 +1120,7 @@ def rank_snap_metrics(snap: t.Tensor, tol: t.Tensor, block: t.Tensor,
     """
     Per block, over the alive lambdas: mean lambda, mean |task grad|, and the
     fraction the total gradient pushes down (grad > 0). Adam normalizes each
-    entry, so it is that sign -- task grad against gamma / N -- that decides
+    entry, so it is that sign -- task grad against gamma / M -- that decides
     whether a bond shrinks, not the gradient's magnitude.
     """
     lam, grad, task = snap
@@ -1126,17 +1156,17 @@ def rank_trace_rows(rec: dict,
     Derived from the sidecar only, so an arm traced before these columns
     existed gets them on re-plot.
     """
-    gamma = trace["gamma"]
     tag = {"arm": rec["arm"], "family": rec["family"]}
     n_alive = trace["alive"].int().sum(1).tolist()
     step_iter = trace["step_iter"].tolist()
-    steps = [dict(tag, iter=it, n_alive=n, coef=gamma / max(n, 1),
-                  grad_norm=g)
+    # gamma / M, M the constant total -- the coefficient of the rank-loss
+    # gradient since comera.RANK_LOSS = "total"
+    coef = trace["gamma"] / max(sum(size for _, _, size in trace["layout"]), 1)
+    steps = [dict(tag, iter=it, n_alive=n, coef=coef, grad_norm=g)
              for it, n, g in zip(step_iter, n_alive,
                                  trace["grad_norm"].tolist())]
 
     sizes = [size for _, _, size in trace["layout"]]
-    n_at = dict(zip(step_iter, n_alive))
     tol = trace["threshold"].split(sizes)
     q = t.tensor(CORE_DIAG_QUANTILES)
     labels = [PCT_LABEL % int(p * 100) for p in CORE_DIAG_QUANTILES]
@@ -1146,7 +1176,6 @@ def rank_trace_rows(rec: dict,
 
     bonds, dist = [], []
     for k, it in enumerate(trace["snap_iter"].tolist()):
-        coef = gamma / max(n_at[it], 1)
         lam, grad, task = (v.split(sizes) for v in trace["snaps"][k])
         for j, (name, bond, size) in enumerate(trace["layout"]):
             block, role = parse_layer_name(name)
@@ -1191,9 +1220,9 @@ def rank_trace_rows(rec: dict,
 
 def plot_rank_trace(rec: dict, trace: dict):
     """
-    Whether lambda is pruned by the task or by the regularizer: N and gamma / N
+    Whether lambda is pruned by the task or by the regularizer: N and gamma / M
     per step, kept fraction per block per step, and at the snapshots the task
-    gradient against gamma / N and the fraction of alive lambdas pushed down.
+    gradient against gamma / M and the fraction of alive lambdas pushed down.
     """
     if not len(trace["step_iter"]):
         return
@@ -1211,7 +1240,7 @@ def plot_rank_trace(rec: dict, trace: dict):
     ax.set_ylabel("N alive", color="#1f77b4")
     ax2 = ax.twinx()
     ax2.plot(xs, [r["coef"] for r in steps], color="#d62728", lw=1.0)
-    ax2.set_ylabel("gamma / N", color="#d62728")
+    ax2.set_ylabel("gamma / M", color="#d62728")
     ax2.set_yscale("log")
     ax.set_title("N and the rank-gradient coefficient", fontsize=9)
 
@@ -1239,11 +1268,11 @@ def plot_rank_trace(rec: dict, trace: dict):
                      color=color[b], lw=1.0)
     coef = sorted({(r["iter"], r["coef"]) for r in bonds})
     axes[2].plot([i for i, _ in coef], [c for _, c in coef], color="black",
-                 ls="--", lw=1.0, label="gamma / N")
+                 ls="--", lw=1.0, label="gamma / M")
     if axes[2].lines:
         axes[2].set_yscale("log")
         axes[2].legend(fontsize=6)
-    axes[2].set_title("|mean task grad| per bond vs gamma / N", fontsize=9)
+    axes[2].set_title("|mean task grad| per bond vs gamma / M", fontsize=9)
     axes[3].axhline(0.5, color="#999999", lw=0.6, ls=":")
     axes[3].set_title("alive lambdas pushed down (grad > 0)", fontsize=9)
     for ax in axes:
@@ -1461,6 +1490,7 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
         "arm": arm.name,
         "kind": arm.kind,
         "family": arm.family,
+        "fmt": arm.fmt if arm.tensorized else None,
         "config_hash": config_hash(arm, cfg),
         "compiled": mode is not None,
         "compile_mode": MODE_TAG[mode],
@@ -1614,7 +1644,8 @@ def log_header(log: ArmLog, arm: Arm, mode: Optional[str], cfg: TrainConfig,
     log.write(f"arm {arm.name}  kind {arm.kind}  compile {MODE_TAG[mode]}  "
               f"config {want}")
     if arm.tensorized:
-        log.write(f"max_rank {arm.max_rank}  gamma {arm.gamma:g}  "
+        log.write(f"format {arm.fmt}  max_rank {arm.max_rank}  "
+                  f"gamma {arm.gamma:g}  "
                   f"lr_rank {arm.lr_rank:g}")
     log.write(f"device {device}  matmul {cfg.matmul_precision}  "
               f"n_layer {cfg.n_layer} n_head {cfg.n_head} "
@@ -1718,13 +1749,15 @@ def rank_rows(rec: dict, cfg: TrainConfig) -> List[dict]:
         init = rec.get("init_ranks", {}).get(name)
         if init is None and role in shapes:
             in_shape, out_shape = shapes[role]
-            init = list(get_uniform_rank(in_shape, out_shape,
-                                         rec["max_rank"])[1:-1])
+            uniform = (get_uniform_ttm_rank if rec.get("fmt") == "ttm"
+                       else get_uniform_rank)
+            init = list(uniform(in_shape, out_shape, rec["max_rank"])[1:-1])
         init = init or [rec["max_rank"]] * len(final)
         for bond, (r0, r1) in enumerate(zip(init, final)):
             rows.append({
                 "arm": rec["arm"],
                 "family": rec["family"],
+                "fmt": rec.get("fmt") or "tt",
                 "max_rank": rec["max_rank"],
                 "lr_rank": rec["lr_rank"],
                 "layer": name,
@@ -1746,6 +1779,7 @@ def rank_summary(rec: dict, rows: List[dict]) -> dict:
     return {
         "arm": rec["arm"],
         "family": rec["family"],
+        "fmt": rec.get("fmt") or "tt",
         "max_rank": rec["max_rank"],
         "lr_rank": rec["lr_rank"],
         "gamma": rec["gamma"],
@@ -1812,7 +1846,7 @@ BENCH_FMT = {"fwd_s": ".5f", "bwd_s": ".5f", "epoch_fwd_min": ".2f",
              "peak_step_mb": ".1f", "param_mb": ".2f", "opt_state_mb": ".2f",
              "first_step_s": ".2f"}
 
-TRAIN_COLUMNS = ["arm", "family", "compile_mode", "max_rank", "lr_rank",
+TRAIN_COLUMNS = ["arm", "family", "fmt", "compile_mode", "max_rank", "lr_rank",
                  "nominal_params", "effective_params", "compression",
                  "final_val_loss", "final_val_ppl", "step_time_s",
                  "param_mb", "effective_param_mb", "peak_memory_mb",
@@ -1825,9 +1859,9 @@ TRAIN_FMT = {"tokens_per_arm": ",d", "epochs": ".2f",
              "effective_param_mb": ".2f", "peak_memory_mb": ".1f",
              "lr_rank": ".0e"}
 
-RANK_COLUMNS = ["arm", "family", "max_rank", "lr_rank", "layer", "block",
+RANK_COLUMNS = ["arm", "family", "fmt", "max_rank", "lr_rank", "layer", "block",
                 "role", "bond", "rank_init", "rank_final", "kept_frac"]
-RANK_SUMMARY_COLUMNS = ["arm", "family", "max_rank", "lr_rank", "gamma",
+RANK_SUMMARY_COLUMNS = ["arm", "family", "fmt", "max_rank", "lr_rank", "gamma",
                         "bonds", "rank_init_total", "rank_final_total",
                         "pruned_frac", "rank_mean", "rank_min", "rank_max",
                         "dead_bonds", "effective_params", "effective_param_mb",
@@ -2049,14 +2083,17 @@ def plot_train(records: List[dict]):
     # pareto: loss against surviving parameters, one line per family
     fig, ax = plt.subplots(figsize=(9, 6))
     families = sorted({r["family"] for r in records if r["kind"] != "dense"},
-                      key=lambda f: (f != "uniform", f))
-    markers = {"uniform": "o"}
+                      key=lambda f: (f.startswith("ttm"),
+                                     not f.endswith("uniform"), f))
     for i, fam in enumerate(families):
         pts = sorted((r for r in records if r["family"] == fam),
                      key=lambda r: r["effective_params"])
+        # marker = scheme, line style = format
         ax.plot([r["effective_params"] for r in pts],
                 [r["final_val_loss"] for r in pts],
-                marker=markers.get(fam, "s"), ms=7, color=f"C{i}", label=fam)
+                marker="o" if fam.endswith("uniform") else "s", ms=7,
+                ls="--" if fam.startswith("ttm") else "-",
+                color=f"C{i}", label=fam)
         for r in pts:
             ax.annotate(f"r{r['max_rank']}",
                         (r["effective_params"], r["final_val_loss"]),
@@ -2143,24 +2180,25 @@ def plot_ranks(summaries: List[dict], rows: List[dict]):
     if not summaries:
         return
     plt = _plt()
-    lrs = sorted({s["lr_rank"] for s in summaries})
+    series = sorted({(s.get("fmt") or "tt", s["lr_rank"]) for s in summaries})
     ranks = sorted({s["max_rank"] for s in summaries})
 
-    def cell(lr, mr, field, default=float("nan")):
+    def cell(key, mr, field, default=float("nan")):
         s = next((s for s in summaries
-                  if s["lr_rank"] == lr and s["max_rank"] == mr), None)
+                  if (s.get("fmt") or "tt", s["lr_rank"]) == key
+                  and s["max_rank"] == mr), None)
         return s[field] if s else default
 
-    # 1 -- pruned fraction against starting rank, one bar per lr_rank
+    # 1 -- pruned fraction against starting rank, one bar per format x lr_rank
     fig, ax = plt.subplots(figsize=(8, 5))
     grouped_bars(ax, [f"max_rank {r}" for r in ranks],
-                 [f"lr_rank {lr:g}" for lr in lrs],
-                 [[cell(lr, mr, "pruned_frac") for mr in ranks] for lr in lrs],
+                 [f"{fmt} lr_rank {lr:g}" for fmt, lr in series],
+                 [[cell(k, mr, "pruned_frac") for mr in ranks] for k in series],
                  fmt="{:.2f}")
     # headroom for the bar labels, which bar_label draws *above* the bar
     ax.set(ylabel="pruned fraction of total rank", ylim=(0, 1.12),
            title="how much rank the adaptive scheme removes")
-    ax.legend(fontsize=8, ncol=len(lrs), loc="upper center",
+    ax.legend(fontsize=8, ncol=min(len(series), 4), loc="upper center",
               bbox_to_anchor=(0.5, -0.08))
     save(fig, "5_rank_pruned_frac.png")
 
@@ -2332,16 +2370,16 @@ def summarize(bench: List[dict], train: List[dict], summaries: List[dict],
             if r.get("cudagraph_skips", 0) > 0:
                 print(f"      ! {r['label']} b{r['batch']}: inductor skipped "
                       f"CUDA Graphs {r['cudagraph_skips']}x -- fusion only")
-        for b in batches:
+        for kind, b in [(k, b) for k in BENCH_KINDS[1:] for b in batches]:
             d = next((r for r in bench if r["kind"] == "dense"
                       and r["compile_mode"] == "eager" and r["batch"] == b), None)
-            g = next((r for r in bench if r["kind"] == "tensorized"
+            g = next((r for r in bench if r["kind"] == kind
                       and r["compile_mode"] == "cudagraph"
                       and r["batch"] == b), None)
-            e = next((r for r in bench if r["kind"] == "tensorized"
+            e = next((r for r in bench if r["kind"] == kind
                       and r["compile_mode"] == "eager" and r["batch"] == b), None)
             if e and g:
-                print(f"      batch {b}: compile+graphs give tensorized "
+                print(f"      batch {b}: compile+graphs give {kind} "
                       f"{e['epoch_total_min']/g['epoch_total_min']:.2f}x"
                       + (f", still {g['epoch_total_min']/d['epoch_total_min']:.2f}x "
                          f"dense-eager" if d else ""))
@@ -2350,16 +2388,16 @@ def summarize(bench: List[dict], train: List[dict], summaries: List[dict],
         # tokens per step, parameters + AdamW states do not, so the tensorized
         # win only surfaces at the small-batch end
         print("\npeak memory of a full step (fwd + bwd + AdamW), eager rows")
-        for b in batches:
+        for kind, b in [(k, b) for k in BENCH_KINDS[1:] for b in batches]:
             d = next((r for r in bench if r["kind"] == "dense"
                       and r["compile_mode"] == "eager" and r["batch"] == b), None)
-            e = next((r for r in bench if r["kind"] == "tensorized"
+            e = next((r for r in bench if r["kind"] == kind
                       and r["compile_mode"] == "eager" and r["batch"] == b), None)
             if not (d and e and d.get("peak_step_mb") and e.get("peak_step_mb")):
                 continue
             print(f"      batch {b:>4d}: dense {d['peak_step_mb']:7.1f} MB "
                   f"(params+states {d['param_mb']+d.get('opt_state_mb', 0):6.1f})"
-                  f"   tensorized {e['peak_step_mb']:7.1f} MB "
+                  f"   {kind:<10s} {e['peak_step_mb']:7.1f} MB "
                   f"(params+states {e['param_mb']+e.get('opt_state_mb', 0):6.1f})"
                   f"   {e['peak_step_mb']/d['peak_step_mb']:.2f}x")
 
@@ -2381,7 +2419,8 @@ def summarize(bench: List[dict], train: List[dict], summaries: List[dict],
         unif = [r for r in train if r["kind"] == "uniform"]
         adap = [r for r in train if r["kind"] == "adaptive"]
         doms = [(a, u) for a in adap for u in unif
-                if a["effective_params"] < u["effective_params"]
+                if a.get("fmt") == u.get("fmt")
+                and a["effective_params"] < u["effective_params"]
                 and a["final_val_loss"] < u["final_val_loss"]]
         for a, u in sorted(doms, key=lambda p: p[0]["effective_params"]):
             print(f"      {a['arm']} dominates {u['arm']}: "
@@ -2390,8 +2429,10 @@ def summarize(bench: List[dict], train: List[dict], summaries: List[dict],
 
     if summaries:
         print("\npruning by lr_rank and starting rank")
-        for s in sorted(summaries, key=lambda s: (s["lr_rank"], s["max_rank"])):
-            print(f"      lr {s['lr_rank']:.0e}  max_rank {s['max_rank']:>3d}"
+        for s in sorted(summaries, key=lambda s: (s["fmt"], s["lr_rank"],
+                                                   s["max_rank"])):
+            print(f"      {s['fmt']:<4s}lr {s['lr_rank']:.0e}  "
+                  f"max_rank {s['max_rank']:>3d}"
                   f"  pruned {s['pruned_frac']*100:5.1f}%"
                   f"  mean rank {s['rank_mean']:5.2f}"
                   f"  dead bonds {s['dead_bonds']:>3d}/{s['bonds']}")
@@ -2486,6 +2527,15 @@ def main():
                     help="subset of training arm names")
     ap.add_argument("--ranks", nargs="*", type=int, default=None,
                     help="rank ladder for the training arms")
+    ap.add_argument("--formats", nargs="+", default=list(FORMATS),
+                    choices=list(FORMATS),
+                    help="tensorized formats trained in phase 2: tt "
+                         "(TTLinear, 2d cores) and/or ttm (TTMLinear, d cores "
+                         "carrying one in and one out mode each). Each gets "
+                         "the uniform and adaptive families")
+    ap.add_argument("--ttm-ranks", nargs="*", type=int, default=None,
+                    help="rank ladder of the ttm arms (default: --ranks). At "
+                         "the same max_rank a ttm model is ~3x the tt one")
     ap.add_argument("--lr-ranks", nargs="*", type=float, default=None,
                     help="rank learning rates, one adaptive family each")
     ap.add_argument("--gamma", type=float, default=comera.GAMMA,
@@ -2672,7 +2722,8 @@ def main():
     modes = [MODE_FROM_TAG[m] for m in args.compile_modes]
     bench_rank = min(args.bench_rank, max(ranks)) if args.smoke \
         else args.bench_rank
-    arms = build_arms(ranks, ranks, lrs, args.gamma)
+    arms = build_arms(ranks, ranks, lrs, args.gamma, args.formats,
+                      args.ttm_ranks)
     if args.arms:
         arms = [a for a in arms if a.name in args.arms]
 
