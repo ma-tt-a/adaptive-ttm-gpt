@@ -233,6 +233,12 @@ class TrainConfig:
     # third (rank params) is per-arm, since it is the pruning axis
     lr: float = comera.LR_ORIGIN      # everything that is not a TT core
     lr_tensor: float = comera.LR_TENSOR   # the TT cores
+    # autocast dtype of the forward: "off" (fp32/tf32) or "bf16". TT layers
+    # stay fp32 inside, since TTMatVec's hand-written backward assumes one dtype
+    amp: str = "off"
+    # iterations between resumable checkpoints of a training arm; 0 = off.
+    # Kept out of the cache key: it changes nothing the arm measures
+    ckpt_interval: int = 0
 
     @property
     def effective_batch(self) -> int:
@@ -253,7 +259,7 @@ class TrainConfig:
             matmul_precision=self.matmul_precision,
             dataset=self.dataset, data_tokens=self.data_tokens,
             data_subset=self.data_subset,
-            lr=self.lr, lr_tensor=self.lr_tensor,
+            lr=self.lr, lr_tensor=self.lr_tensor, amp=self.amp,
         )
 
 
@@ -434,7 +440,7 @@ def hash_payload(*parts) -> str:
 # kept out of the fingerprint so retuning the diagnostics does not invalidate
 # hours of cached training runs -- the price is that a cached record keeps
 # whatever diagnostics it was computed with (--force to resample).
-HASH_IGNORED = ("core_diag_interval", "rank_diag_interval")
+HASH_IGNORED = ("core_diag_interval", "rank_diag_interval", "ckpt_interval")
 
 # defaults of fields added after the cache already existed. A run that leaves
 # one alone measures exactly what the old code measured, so the field is
@@ -444,7 +450,8 @@ HASH_LEGACY = {"dataset": "shakespeare",
                "data_tokens": data.FINEWEB_TOKENS,
                "data_subset": data.FINEWEB_SUBSET,
                "lr": comera.LR_ORIGIN,
-               "lr_tensor": comera.LR_TENSOR}
+               "lr_tensor": comera.LR_TENSOR,
+               "amp": "off"}
 
 
 def cfg_fingerprint(cfg: TrainConfig) -> dict:
@@ -584,6 +591,14 @@ def lr_multiplier(it: int, cfg: TrainConfig) -> float:
     return cfg.min_lr_frac + (1 - cfg.min_lr_frac) * cosine
 
 
+def autocast(cfg: TrainConfig, device: t.device):
+    """
+    The forward's precision context: a no-op unless cfg.amp is "bf16"
+    """
+    return t.autocast(device.type, dtype=t.bfloat16,
+                      enabled=cfg.amp == "bf16")
+
+
 @t.no_grad()
 def estimate_loss(model, ds: data.Dataset, cfg: TrainConfig,
                   device: t.device) -> Dict[str, float]:
@@ -595,7 +610,8 @@ def estimate_loss(model, ds: data.Dataset, cfg: TrainConfig,
         for _ in range(cfg.eval_iters):
             X, Y = ds.get_batch(split, cfg.batch_size, cfg.block_size,
                                 device, generator=gen)
-            _, loss = model(X, Y)
+            with autocast(cfg, device):
+                _, loss = model(X, Y)
             losses.append(loss.item())
         out[split] = sum(losses) / len(losses)
     model.train()
@@ -1286,7 +1302,8 @@ def plot_rank_trace(rec: dict, trace: dict):
 def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
               ds: data.Dataset, device: t.device,
               trace_path: Optional[str] = None,
-              log: Optional["ArmLog"] = None) -> dict:
+              log: Optional["ArmLog"] = None,
+              ckpt_path: Optional[str] = None) -> dict:
     """
     Train one arm and collect every measurement the plots need
     """
@@ -1333,8 +1350,30 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
     step_times: List[float] = []
     first_step_time = None
 
+    # resume an interrupted arm: everything the loop accumulates, plus the
+    # optimizer and the batch stream, so the remaining iterations are the
+    # ones an uninterrupted run would have taken
+    start = 0
+    ckpt_on = bool(ckpt_path and cfg.ckpt_interval > 0)
+    if ckpt_on and os.path.exists(ckpt_path):
+        # cpu: load_state_dict moves weights and Adam states to the device, and
+        # the generator and tracer halves must stay on the cpu
+        ck = t.load(ckpt_path, map_location="cpu", weights_only=False)
+        raw_model.load_state_dict(ck["model"])
+        opt.load_state_dict(ck["opt"])
+        gen.set_state(ck["gen"])
+        history, core_diag, core_dist = (ck["history"], ck["core_diag"],
+                                         ck["core_dist"])
+        step_times, first_step_time = ck["step_times"], ck["first_step_time"]
+        if tracer:
+            tracer.__dict__.update(ck["tracer"])
+        start = ck["it"] + 1
+        msg = f"resumed from {ckpt_path} at iteration {start}"
+        log.write(msg) if log else tqdm.write(f"    {msg}")
+
     model.train()
-    bar = tqdm(range(cfg.max_iters), desc=f"{arm.name}/{MODE_TAG[mode]}",
+    bar = tqdm(range(start, cfg.max_iters),
+               desc=f"{arm.name}/{MODE_TAG[mode]}",
                leave=False, disable=BAR_DISABLE)
     last_eval = None  # (iter, train, val) of the latest estimate_loss
     t_loop = time.perf_counter()  # wall clock for the ETA: evals included
@@ -1355,7 +1394,8 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
             for micro in range(cfg.grad_accum):
                 X, Y = ds.get_batch("train", cfg.batch_size, cfg.block_size,
                                     device, generator=gen)
-                _, model_loss = model(X, Y)
+                with autocast(cfg, device):
+                    _, model_loss = model(X, Y)
                 if log_due:   # summed on device, read once per line
                     part = model_loss.detach() / cfg.grad_accum
                     step_loss = part if step_loss is None else step_loss + part
@@ -1452,7 +1492,24 @@ def train_arm(arm: Arm, mode: Optional[str], cfg: TrainConfig,
                 log.write(line)
             else:
                 tqdm.write(f"    {arm.name}/{MODE_TAG[mode]} {line}")
+
+        if (ckpt_on and (it + 1) % cfg.ckpt_interval == 0
+                and it < cfg.max_iters - 1):
+            if tracer:   # the pending half lives on device; the flushed half is state
+                tracer.flush(run)
+            tmp = ckpt_path + ".tmp"
+            t.save({"it": it, "model": raw_model.state_dict(),
+                    "opt": opt.state_dict(), "gen": gen.get_state(),
+                    "history": history, "core_diag": core_diag,
+                    "core_dist": core_dist, "step_times": step_times,
+                    "first_step_time": first_step_time,
+                    "tracer": ({k: getattr(tracer, k) for k in
+                                ("steps", "alive", "norms", "snap_iters",
+                                 "snaps")} if tracer else None)}, tmp)
+            os.replace(tmp, ckpt_path)   # never a half-written checkpoint
     bar.close()
+    if ckpt_on and os.path.exists(ckpt_path):
+        os.remove(ckpt_path)
 
     mem = peak_memory(device) - mem_base + param_bytes
     ranks = comera.rank_report(raw_model)
@@ -1697,7 +1754,8 @@ def run_train(arms: List[Arm], cfg: TrainConfig, ds: data.Dataset,
             with ArmLog(log_path) as log:
                 log_header(log, a, m, cfg, ds, device, want)
                 rec = train_arm(a, m, cfg, ds, device,
-                                path[:-len(".json")] + ".rank.pt", log)
+                                path[:-len(".json")] + ".rank.pt", log,
+                                path[:-len(".json")] + ".ckpt.pt")
                 log_footer(log, rec)
             return rec
 
@@ -2581,6 +2639,16 @@ def main():
                     help="linear warmup iterations before the cosine decay "
                          "(default 100, 5 under --smoke)")
     ap.add_argument("--iters", type=int, default=None)
+    ap.add_argument("--amp", choices=["off", "bf16"], default=None,
+                    help="bf16 autocast of the forward (default off). Part "
+                         "of the cache key. TT layers run fp32 inside it")
+    ap.add_argument("--eval-iters", type=int, default=None,
+                    help="batches per split in each loss estimate (default "
+                         "20, smoke 5); part of the cache key")
+    ap.add_argument("--ckpt-interval", type=int, default=None,
+                    help="iterations between resumable checkpoints of a "
+                         "training arm (default 0 = off). An interrupted arm "
+                         "restarts from its last checkpoint")
     ap.add_argument("--seed", type=int, default=None,
                     help="init and batch-stream seed (default 42). Part of the "
                          "cache key, so a second seed trains fresh arms")
@@ -2677,6 +2745,12 @@ def main():
         cfg.warmup_iters = args.warmup
     if args.iters is not None:
         cfg.max_iters = args.iters
+    if args.amp is not None:
+        cfg.amp = args.amp
+    if args.eval_iters is not None:
+        cfg.eval_iters = args.eval_iters
+    if args.ckpt_interval is not None:
+        cfg.ckpt_interval = args.ckpt_interval
     if args.seed is not None:
         cfg.seed = args.seed
     if args.log_interval is not None:

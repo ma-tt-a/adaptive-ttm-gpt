@@ -145,6 +145,9 @@ memory numbers were measured under an older protocol instead of mixing them with
 | `--arms NAME ...` | all | subset of arm names, e.g. `--arms dense uniform-r16 adaptive-r16-lr0.01`. |
 | `--train-compile-mode eager\|compile\|cudagraph` | `compile` (smoke `eager`) | how the tensorized arms are compiled. **dense always trains eager.** `cudagraph` is not the default: CUDA Graphs replay a captured graph whose parameters AdamW mutates outside it, which inductor skips silently — phase 1 is where the graph win is measured. |
 | `--iters N` | `1500` (smoke `50`) | training iterations per arm — i.e. optimizer steps, each of which now consumes `--grad-accum` micro-batches. |
+| `--amp off\|bf16` | `off` | bf16 autocast of every forward (training and eval). Part of the cache key. `TTLinear` runs fp32 inside it — `TTMatVec`'s hand-written backward mixes saved tensors with the incoming gradient — while `TTMLinear`'s einsum runs in bf16. |
+| `--eval-iters N` | `20` (smoke `5`) | micro-batches per split in each loss estimate; part of the cache key. |
+| `--ckpt-interval N` | `0` (off) | iterations between resumable checkpoints (`results/runs/<run>.ckpt.pt`: model, AdamW, batch-stream generator, history, diagnostics, rank trace). An interrupted arm restarts from its last checkpoint; the result is bit-identical to an uninterrupted run (checked). Deleted when the arm finishes. Not part of the cache key. |
 | `--seed N` | `42` | init and batch-stream seed; part of the cache key, so each seed is its own set of arms. |
 | `--micro-batch N` | `32` (smoke `8`) | sequences per forward. This is what activation memory scales with. |
 | `--grad-accum N` | `1` | forward/backward passes accumulated before each optimizer step. |

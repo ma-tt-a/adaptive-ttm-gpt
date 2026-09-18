@@ -145,7 +145,11 @@ class TTLinear(TensorizedLinear):
         return res
 
     def matvec(self, X, cores):
-        return TTMatVec.apply(X, *cores)
+        # fp32 under autocast too: the hand-written backward mixes the saved
+        # tensors with the incoming gradient, which autocast would leave in
+        # different dtypes
+        with t.autocast(X.device.type, enabled=False):
+            return TTMatVec.apply(X.float(), *[G.float() for G in cores])
 
 
 class TTMLinear(TensorizedLinear):
